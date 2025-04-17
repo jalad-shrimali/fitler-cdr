@@ -18,7 +18,7 @@ func UploadAndFilterCSV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── 1. Get user parameters ────────────────────────────────────────────────
+	// ── 1. Get user parameters 
 	fieldName := strings.TrimSpace(r.FormValue("search_field"))
 	fieldValue := strings.TrimSpace(r.FormValue("search_value"))
 	if fieldName == "" || fieldValue == "" {
@@ -26,7 +26,7 @@ func UploadAndFilterCSV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── 2. Receive & persist the upload ───────────────────────────────────────
+	// ── 2. Receive & persist the upload 
 	file, handler, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "Error retrieving file: "+err.Error(), http.StatusBadRequest)
@@ -54,9 +54,9 @@ func UploadAndFilterCSV(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to write uploaded file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	out.Close() // close before reopening
+	out.Close()
 
-	// ── 3. Open for reading & set up writer for the result ────────────────────
+	// ── 3. Open for reading & set up writer for the result 
 	in, err := os.Open(uploadPath)
 	if err != nil {
 		http.Error(w, "Error opening uploaded file: "+err.Error(), http.StatusInternalServerError)
@@ -99,7 +99,7 @@ func UploadAndFilterCSV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── 4. Stream‑filter rows ────────────────────────────────────────────────
+	// ── 4. Stream‑filter rows
 	matches := 0
 	want := strings.ToLower(fieldValue)
 
@@ -123,7 +123,7 @@ func UploadAndFilterCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	writer.Flush()
 
-	// ── 5. Respond ───────────────────────────────────────────────────────────
+	// ── 5. Respond
 	if matches == 0 {
 		fmt.Fprintf(w, "No matching records found for %s = %s\n", fieldName, fieldValue)
 		return
