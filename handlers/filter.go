@@ -7,26 +7,92 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
-// UploadAndFilterCSV reads an uploaded CSV and returns all rows whose
-// <search_field> exactly matches <search_value> (case‑insensitive).
-func UploadAndFilterCSV(w http.ResponseWriter, r *http.Request) {
+/* ──────────────────────────── mapping tables ───────────────────────────── */
+
+var targetHeader = []string{
+	"CdrNo", "B Party", "Date", "Time", "Duration", "Call Type",
+	"First Cell ID", "First Cell ID Address", "Last Cell ID", "Last Cell ID Address",
+	"IMEI", "IMSI", "Roaming", "Main City(First CellID)", "Sub City (First CellID)",
+	"Lat-Long-Azimuth (First CellID)", "Crime", "Circle", "Operator", "LRN",
+	"CallForward", "B Party Provider", "B Party Circle", "B Party Operator",
+	"Type", "IMEI Manufacturer",
+}
+
+// normalised source‑column → canonical 26‑column
+var synonyms = map[string]string{
+	// numbers
+	"target no":                      "CdrNo",
+	"calling party telephone number": "CdrNo",
+	"calling number":                 "CdrNo",
+	"b party no":                     "B Party",
+	"called party telephone number":  "B Party",
+
+	// date / time / duration
+	"date":          "Date",
+	"call date":     "Date",
+	"time":          "Time",
+	"call time":     "Time",
+	"dur(s)":        "Duration",
+	"call duration": "Duration",
+
+	// call type
+	"call type": "Call Type",
+
+	// cell IDs
+	"first cell id": "First Cell ID",
+	"first cgi":     "First Cell ID",
+	"last cell id":  "Last Cell ID",
+	"last cgi":      "Last Cell ID",
+
+	// device / subscriber
+	"imei": "IMEI",
+	"imsi": "IMSI",
+
+	// roaming / operator
+	"roam nw":             "Roaming",
+	"roaming circle name": "Circle",
+	"circle":              "Circle",
+	"operator":            "Operator",
+
+	// lrn / call‑forward
+	"lrn no":          "LRN",
+	"lrn called no":   "LRN",
+	"lrn":             "LRN",
+	"call fow no":     "CallForward",
+	"call forwarding": "CallForward",
+
+	// provider
+	"lrn tsp-lsa":      "B Party Provider",
+	"b party provider": "B Party Provider",
+	"b party circle":   "B Party Circle",
+	"b party operator": "B Party Operator",
+
+	// misc
+	"service type": "Type",
+}
+
+/* ───────────────────────── utility functions ───────────────────────────── */
+
+var spaceRE = regexp.MustCompile(`\s+`)
+
+func norm(s string) string { // trim, lower, collapse spaces
+	return spaceRE.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), " ")
+}
+
+/* ──────────────────────────── main handler ─────────────────────────────── */
+
+// UploadAndNormalizeCSV converts any operator CSV into the 26‑column format.
+func UploadAndNormalizeCSV(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST method allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// ── 1. Get user parameters 
-	fieldName := strings.TrimSpace(r.FormValue("search_field"))
-	fieldValue := strings.TrimSpace(r.FormValue("search_value"))
-	if fieldName == "" || fieldValue == "" {
-		http.Error(w, "search_field and search_value are required", http.StatusBadRequest)
-		return
-	}
-
-	// ── 2. Receive & persist the upload 
+	/* ---- receive the file ------------------------------------------------ */
 	file, handler, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "Error retrieving file: "+err.Error(), http.StatusBadRequest)
@@ -34,101 +100,103 @@ func UploadAndFilterCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	if err := os.MkdirAll("uploads", os.ModePerm); err != nil {
-		http.Error(w, "Unable to create uploads dir: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := os.MkdirAll("filtered", os.ModePerm); err != nil {
-		http.Error(w, "Unable to create filtered dir: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	uploadPath := filepath.Join("uploads", handler.Filename)
-	out, err := os.Create(uploadPath)
-	if err != nil {
-		http.Error(w, "Unable to save uploaded file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if _, err := io.Copy(out, file); err != nil {
-		out.Close()
-		http.Error(w, "Failed to write uploaded file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	out.Close()
-
-	// ── 3. Open for reading & set up writer for the result 
-	in, err := os.Open(uploadPath)
-	if err != nil {
-		http.Error(w, "Error opening uploaded file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer in.Close()
-
-	reader := csv.NewReader(in)
-
-	header, err := reader.Read()
-	if err != nil {
-		http.Error(w, "Error reading header: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Build a map of normalised header names → column index
-	colIndex := make(map[string]int, len(header))
-	for i, h := range header {
-		colIndex[strings.ToLower(strings.TrimSpace(h))] = i
-	}
-
-	idx, ok := colIndex[strings.ToLower(fieldName)]
-	if !ok {
-		http.Error(w, fmt.Sprintf("Column %q not found in CSV", fieldName), http.StatusBadRequest)
-		return
-	}
-
-	filteredPath := filepath.Join("filtered", "filtered_"+handler.Filename)
-	outFiltered, err := os.Create(filteredPath)
-	if err != nil {
-		http.Error(w, "Unable to create filtered file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer outFiltered.Close()
-
-	writer := csv.NewWriter(outFiltered)
-	// copy the full header
-	if err := writer.Write(header); err != nil {
-		http.Error(w, "Error writing header: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// ── 4. Stream‑filter rows
-	matches := 0
-	want := strings.ToLower(fieldValue)
-
-	for {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// skip malformed line but keep the server alive
-			fmt.Println("Skipping bad record:", err)
-			continue
-		}
-
-		if strings.EqualFold(strings.TrimSpace(record[idx]), want) {
-			if err := writer.Write(record); err != nil {
-				fmt.Println("Error writing record:", err)
-			}
-			matches++
+	for _, dir := range []string{"uploads", "filtered"} {
+		if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+			http.Error(w, "Unable to create "+dir+": "+err.Error(), http.StatusInternalServerError)
+			return
 		}
 	}
-	writer.Flush()
 
-	// ── 5. Respond
-	if matches == 0 {
-		fmt.Fprintf(w, "No matching records found for %s = %s\n", fieldName, fieldValue)
+	srcPath := filepath.Join("uploads", handler.Filename)
+	dstPath := filepath.Join("filtered", "filtered_"+handler.Filename)
+
+	if err := saveUploaded(file, srcPath); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := normalizeFile(srcPath, dstPath); err != nil {
+		http.Error(w, "Normalization failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "Filtered file created: /download/%s\n", filepath.Base(filteredPath))
+	fmt.Fprintf(w, "Normalized file created: /download/%s\n", filepath.Base(dstPath))
+}
+
+/* ───────────────────── low‑level helpers (IO & transform) ─────────────── */
+
+func saveUploaded(src io.Reader, dst string) error {
+	f, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("save upload: %w", err)
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, src); err != nil {
+		return fmt.Errorf("write upload: %w", err)
+	}
+	return nil
+}
+
+func normalizeFile(srcPath, dstPath string) error {
+	inF, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer inF.Close()
+	r := csv.NewReader(inF)
+
+	srcHeader, err := r.Read()
+	if err != nil {
+		return err
+	}
+
+	// map src‑index → dst‑index
+	indexMap := make(map[int]int)
+	for i, h := range srcHeader {
+		if canon, ok := synonyms[norm(h)]; ok {
+			for j, want := range targetHeader {
+				if want == canon {
+					indexMap[i] = j
+					break
+				}
+			}
+		}
+	}
+
+	outF, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer outF.Close()
+	w := csv.NewWriter(outF)
+
+	if err := w.Write(targetHeader); err != nil {
+		return err
+	}
+
+	blank := make([]string, len(targetHeader))
+
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Println("Skipping malformed line:", err)
+			continue
+		}
+
+		row := append([]string(nil), blank...) // fresh slice
+		for srcIdx, dstIdx := range indexMap {
+			if srcIdx < len(rec) {
+				row[dstIdx] = strings.Trim(rec[srcIdx], "'") // remove stray quotes
+			}
+		}
+		if err := w.Write(row); err != nil {
+			return err
+		}
+	}
+	w.Flush()
+	return w.Error()
 }

@@ -8,8 +8,9 @@ import (
 )
 
 func main() {
-	http.HandleFunc("/upload", handlers.UploadAndFilterCSV)
-	http.Handle("/download/", http.StripPrefix("/download/", http.FileServer(http.Dir("filtered"))))
+	http.HandleFunc("/upload", handlers.UploadAndNormalizeCSV)
+	http.Handle("/download/",
+		http.StripPrefix("/download/", http.FileServer(http.Dir("filtered"))))
 
 	log.Println("Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
