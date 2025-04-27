@@ -4,11 +4,11 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/jalad-shrimali/cdr-filter/handlers"
+	// "github.com/jalad-shrimali/cdr-filter/handlers"
 )
 
 func main() {
-	http.HandleFunc("/upload", handlers.UploadAndNormalizeCSV)
+	http.HandleFunc("/upload", UploadAndNormalizeCSV)
 	http.Handle("/download/",
 		http.StripPrefix("/download/", http.FileServer(http.Dir("filtered"))))
 
