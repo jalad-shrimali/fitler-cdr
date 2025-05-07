@@ -1,0 +1,343 @@
+LRN No,Circle,TSP
+2100,Bihar,VI
+2101,Chennai,AIRCEL
+2102,Andhra Pradesh,AIRCEL
+2103,Delhi,AIRCEL
+2104,Gujarat,AIRCEL
+2105,Karnataka,AIRCEL
+2106,Maharashtra,AIRCEL
+2107,Mumbai,AIRCEL
+2108,Rajasthan,AIRCEL
+2109,Tamil Nadu,AIRCEL
+2390,Bihar,ALLIANZ INFRA
+2391,Madhya Pradesh,ALLIANZ INFRA
+2392,Andhra Pradesh,BSNL
+2393,Assam,BSNL
+2394,Bihar,BSNL
+2395,Chennai,BSNL
+2396,Gujarat,BSNL
+2397,Haryana,BSNL
+2398,Himachal Pradesh,BSNL
+2399,Jammu and Kashmir,BSNL
+2490,Karnataka,BSNL
+2491,Kerala,BSNL
+2492,Kolkata,BSNL
+2493,Madhya Pradesh,BSNL
+2494,Maharashtra,BSNL
+2495,Northeast,BSNL
+2496,Odisha,BSNL
+2497,Punjab,BSNL
+2498,Rajasthan,BSNL
+2499,Tamil Nadu,BSNL
+2540,Uttar Pradesh (East),BSNL
+2541,Uttar Pradesh (West),BSNL
+2542,West Bengal,BSNL
+2543,Andhra Pradesh,BSNL
+2544,Assam,BSNL
+2545,Bihar,BSNL
+2546,Chennai,BSNL
+2547,Gujarat,BSNL
+2548,Haryana,BSNL
+2549,Himachal Pradesh,BSNL
+2700,Jammu and Kashmir,BSNL
+2701,Karnataka,BSNL
+2702,Kerala,BSNL
+2703,Kolkata,BSNL
+2704,Madhya Pradesh,BSNL
+2705,Maharashtra,BSNL
+2706,Northeast,BSNL
+2707,Odisha,BSNL
+2708,Punjab,BSNL
+2709,Rajasthan,BSNL
+2720,Tamil Nadu,BSNL
+2721,Uttar Pradesh (East),BSNL
+2722,Uttar Pradesh (West),BSNL
+2723,West Bengal,BSNL
+2724,Andhra Pradesh,AIRTEL
+2725,Assam,AIRTEL
+2726,Bihar,AIRTEL
+2727,Delhi,AIRTEL
+2728,Gujarat,AIRTEL
+2729,Haryana,AIRTEL
+3000,Himachal Pradesh,AIRTEL
+3001,Jammu and Kashmir,AIRTEL
+3002,Karnataka,AIRTEL
+3003,Kerala,AIRTEL
+3004,Kolkata,AIRTEL
+3005,Madhya Pradesh,AIRTEL
+3006,Maharashtra,AIRTEL
+3007,Mumbai,AIRTEL
+3008,Odisha,AIRTEL
+3009,Punjab,AIRTEL
+3020,Tamil Nadu,AIRTEL
+3021,Uttar Pradesh (East),AIRTEL
+3022,Uttar Pradesh (West),AIRTEL
+3023,West Bengal,AIRTEL
+3024,Northeast,AIRTEL
+3025,Rajasthan,AIRTEL
+3026,Mumbai,BPL
+3027,Andhra Pradesh,DATACOM
+3028,Assam,DATACOM
+3029,Bihar,DATACOM
+3030,Delhi,DATACOM
+3031,Gujarat,DATACOM
+3032,Haryana,DATACOM
+3033,Himachal Pradesh,DATACOM
+3034,Jammu and Kashmir,DATACOM
+3035,Karnataka,DATACOM
+3036,Kerala,DATACOM
+3037,Kolkata,DATACOM
+3038,Madhya Pradesh,DATACOM
+3039,Maharashtra,DATACOM
+3040,Mumbai,DATACOM
+3041,Northeast,DATACOM
+3042,Odisha,DATACOM
+3043,Rajasthan,DATACOM
+3044,West Bengal,RELIANCE JIO
+3045,Uttar Pradesh (East),DATACOM
+3046,Uttar Pradesh (West),DATACOM
+3047,West Bengal,DATACOM
+3048,Assam,DISHNET
+3049,Bihar,DISHNET
+3050,Haryana,DISHNET
+3051,Himachal Pradesh,DISHNET
+3052,Jammu and Kashmir,DISHNET
+3053,Kerala,DISHNET
+3054,Kolkata,DISHNET
+3055,Madhya Pradesh,DISHNET
+3056,Northeast,DISHNET
+3057,Odisha,DISHNET
+3058,Punjab,DISHNET
+3059,Uttar Pradesh (East),DISHNET
+3060,Uttar Pradesh (West),DISHNET
+3061,West Bengal,DISHNET
+3062,Punjab,HFCL
+3063,Punjab,HFCL
+3064,Andhra Pradesh,VI
+3065,Assam,VI
+3066,Delhi,VI
+3067,Gujarat,VI
+3068,Haryana,VI
+3069,Himachal Pradesh,VI
+3070,Jammu and Kashmir,VI
+3071,Karnataka,VI
+3072,Kerala,VI
+3073,Kolkata,VI
+3074,Madhya Pradesh,VI
+3075,Maharashtra,VI
+3076,Mumbai,VI
+3077,Northeast,VI
+3078,Odisha,VI
+3079,Punjab,VI
+3080,Rajasthan,VI
+3081,Tamil Nadu,VI
+3082,Uttar Pradesh (East),VI
+3083,Uttar Pradesh (West),VI
+3084,West Bengal,VI
+3085,Andhra Pradesh,RELIANCE JIO
+3086,Assam,RELIANCE JIO
+3087,Bihar,RELIANCE JIO
+3088,Gujarat,RELIANCE JIO
+3089,Haryana,RELIANCE JIO
+3090,Himachal Pradesh,RELIANCE JIO
+3091,Jammu and Kashmir,RELIANCE JIO
+3092,Karnataka,RELIANCE JIO
+3093,Kerala,RELIANCE JIO
+3094,Madhya Pradesh,RELIANCE JIO
+3095,Maharashtra,RELIANCE JIO
+3096,Northeast,RELIANCE JIO
+3097,Odisha,RELIANCE JIO
+3098,Punjab,RELIANCE JIO
+3099,Rajasthan,RELIANCE JIO
+3100,Tamil Nadu,RELIANCE JIO
+3101,Uttar Pradesh (West),RELIANCE JIO
+3102,Uttar Pradesh (East),RELIANCE JIO
+3103,Delhi,RELIANCE JIO
+3104,Kolkata,RELIANCE JIO
+3105,Mumbai,RELIANCE JIO
+3106,Delhi,MTNL
+3107,Mumbai,MTNL
+3108,Delhi,MTNL
+3109,Mumbai,MTNL
+3110,Andhra Pradesh,RELIANCE COM
+3111,Bihar,RELIANCE COM
+3112,Delhi,RELIANCE COM
+3113,Gujarat,RELIANCE COM
+3114,Haryana,RELIANCE COM
+3115,Himachal Pradesh,RELIANCE COM
+3116,Jammu and Kashmir,RELIANCE COM
+3117,Karnataka,RELIANCE COM
+3118,Kerala,RELIANCE COM
+3119,Kolkata,RELIANCE COM
+3120,Madhya Pradesh,RELIANCE COM
+3121,Maharashtra,RELIANCE COM
+3122,Mumbai,RELIANCE COM
+3123,Odisha,RELIANCE COM
+3124,Punjab,RELIANCE COM
+3125,Rajasthan,RELIANCE COM
+3126,Tamil Nadu,RELIANCE COM
+3127,Uttar Pradesh (East),RELIANCE COM
+3128,Uttar Pradesh (West),RELIANCE COM
+3129,West Bengal,RELIANCE COM
+3130,Andhra Pradesh,RELIANCE COM
+3131,Delhi,RELIANCE COM
+3132,Gujarat,RELIANCE COM
+3133,Haryana,RELIANCE COM
+3134,Jammu and Kashmir,RELIANCE COM
+3135,Karnataka,RELIANCE COM
+3136,Kerala,RELIANCE COM
+3137,Maharashtra,RELIANCE COM
+3138,Mumbai,RELIANCE COM
+3139,Punjab,RELIANCE COM
+3140,Rajasthan,RELIANCE COM
+3141,Tamil Nadu,RELIANCE COM
+3142,Uttar Pradesh (East),RELIANCE COM
+3143,Uttar Pradesh (West),RELIANCE COM
+3144,Assam,RELIANCE  TEL
+3145,Bihar,RELIANCE  TEL
+3146,Himachal Pradesh,RELIANCE  TEL
+3147,Kolkata,RELIANCE  TEL
+3148,Madhya Pradesh,RELIANCE  TEL
+3149,Northeast,RELIANCE  TEL
+3150,Odisha,RELIANCE  TEL
+3151,West Bengal,RELIANCE  TEL
+3152,Assam,RELIANCE  TEL
+3153,Northeast,RELIANCE  TEL
+3154,Assam,S TEL
+3155,Bihar,S TEL
+3156,Himachal Pradesh,S TEL
+3157,Jammu and Kashmir,S TEL
+3158,Northeast,S TEL
+3159,Odisha,S TEL
+3160,Andhra Pradesh,SHYAM TELELINK
+3161,Assam,SHYAM TELELINK
+3162,Bihar,SHYAM TELELINK
+3163,Delhi,SHYAM TELELINK
+3164,Gujarat,SHYAM TELELINK
+3165,Haryana,SHYAM TELELINK
+3166,Himachal Pradesh,SHYAM TELELINK
+3167,Jammu and Kashmir,SHYAM TELELINK
+3168,Karnataka,SHYAM TELELINK
+3169,Kerala,SHYAM TELELINK
+3180,Kolkata,SHYAM TELELINK
+3181,Madhya Pradesh,SHYAM TELELINK
+3182,Maharashtra,SHYAM TELELINK
+3183,Mumbai,SHYAM TELELINK
+3184,Northeast,SHYAM TELELINK
+3185,Odisha,SHYAM TELELINK
+3186,Punjab,SHYAM TELELINK
+3187,Tamil Nadu,SHYAM TELELINK
+3188,Uttar Pradesh (East),SHYAM TELELINK
+3189,Uttar Pradesh (West),SHYAM TELELINK
+3200,West Bengal,SHYAM TELELINK
+3201,Rajasthan,SHYAM TELELINK
+3202,Andhra Pradesh,VI
+3203,Delhi,VI
+3204,Haryana,VI
+3205,Karnataka,VI
+3206,Maharashtra,VI
+3207,Punjab,VI
+3208,Tamil Nadu,BSNL
+3209,Delhi,SWAN
+3270,Gujarat,SWAN
+3271,Haryana,SWAN
+3272,Karnataka,SWAN
+3273,Kerala,SWAN
+3274,Maharashtra,SWAN
+3275,Mumbai,SWAN
+3276,Punjab,SWAN
+3277,Rajasthan,SWAN
+3278,Tamil Nadu,SWAN
+3279,Uttar Pradesh (East),SWAN
+3280,Uttar Pradesh (West),SWAN
+3281,Maharashtra,AIRTEL
+3282,Mumbai,AIRTEL
+3283,Andhra Pradesh,AIRTEL
+3284,Assam,AIRTEL
+3285,Bihar,AIRTEL
+3286,Chennai,AIRTEL
+3287,Delhi,AIRTEL
+3288,Gujarat,AIRTEL
+3289,Haryana,AIRTEL
+3290,Himachal Pradesh,AIRTEL
+3291,Jammu and Kashmir,AIRTEL
+3292,Karnataka,AIRTEL
+3293,Kerala,AIRTEL
+3294,Kolkata,AIRTEL
+3295,Madhya Pradesh,AIRTEL
+3296,Northeast,AIRTEL
+3297,Odisha,AIRTEL
+3298,Punjab,AIRTEL
+3299,Rajasthan,AIRTEL
+3400,Tamil Nadu,AIRTEL
+3401,Uttar Pradesh (East),AIRTEL
+3402,Uttar Pradesh (West),AIRTEL
+3403,West Bengal,AIRTEL
+3404,Maharashtra,AIRTEL
+3405,Mumbai,AIRTEL
+3406,Andhra Pradesh,AIRTEL
+3407,Assam,AIRTEL
+3408,Bihar,AIRTEL
+3409,Chennai,AIRTEL
+3440,Delhi,AIRTEL
+3441,Gujarat,AIRTEL
+3442,Haryana,AIRTEL
+3443,Himachal Pradesh,AIRTEL
+3444,Jammu and Kashmir,AIRTEL
+3445,Karnataka,AIRTEL
+3446,Kerala,AIRTEL
+3447,Kolkata,AIRTEL
+3448,Madhya Pradesh,AIRTEL
+3449,Northeast,AIRTEL
+3490,Odisha,AIRTEL
+3491,Punjab,AIRTEL
+3492,Rajasthan,AIRTEL
+3493,Tamil Nadu,AIRTEL
+3494,Uttar Pradesh (East),AIRTEL
+3495,Uttar Pradesh (West),AIRTEL
+3496,West Bengal,AIRTEL
+3497,Delhi,UNITECH
+3498,Assam,UNITECH
+3499,Bihar,UNITECH
+3500,Northeast,UNITECH
+3501,Odisha,UNITECH
+3502,Uttar Pradesh (East),UNITECH
+3503,West Bengal,UNITECH
+3504,Kolkata,UNITECH
+3505,Mumbai,UNITECH
+3506,Haryana,UNITECH
+3507,Himachal Pradesh,UNITECH
+3508,Jammu and Kashmir,UNITECH
+3509,Punjab,UNITECH
+3570,Rajasthan,UNITECH
+3571,Uttar Pradesh (West),UNITECH
+3572,Andhra Pradesh,UNITECH
+3573,Karnataka,UNITECH
+3574,Kerala,UNITECH
+3575,Tamil Nadu,UNITECH
+3576,Gujarat,UNITECH
+3577,Madhya Pradesh,UNITECH
+3578,Maharashtra,UNITECH
+3579,Kerala,VI
+4100,Maharashtra,VI
+4101,Tamil Nadu,VI
+4102,Haryana,VI
+4103,Rajasthan,VI
+4104,Uttar Pradesh (East),VI
+4105,Kolkata,VI
+4106,Gujarat,VI
+4107,Mumbai,VI
+4108,Delhi,VI
+4109,Andhra Pradesh,VI
+4120,Chennai,VI
+4121,Karnataka,VI
+4122,Punjab,VI
+4123,Uttar Pradesh (West),VI
+4124,West Bengal,VI
+4125,Assam,VI
+4126,Bihar,VI
+4127,Himachal Pradesh,VI
+4128,Jammu and Kashmir,VI
+4129,Madhya Pradesh,VI
+4190,Northeast,VI
+4191,Odisha,VI

@@ -1,283 +1,382 @@
 package main
 
-import (
-	"embed"
-	"encoding/csv"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"os"
-	"path/filepath"
-	"regexp"
-	"strings"
-)
+// import (
+// 	"embed"
+// 	"encoding/csv"
+// 	"errors"
+// 	"fmt"
+// 	"io"
+// 	"log"
+// 	"net/http"
+// 	"os"
+// 	"path/filepath"
+// 	"regexp"
+// 	"strings"
+// )
 
-/* ──────────── canonical 26-column layout (keep order) ─────────────── */
+// /* ── canonical 26-column output header (DO NOT CHANGE ORDER) ────────────── */
+// var targetHeader = []string{
+// 	"CdrNo", "B Party", "Date", "Time", "Duration", "Call Type",
+// 	"First Cell ID", "First Cell ID Address",
+// 	"Last Cell ID", "Last Cell ID Address",
+// 	"IMEI", "IMSI", "Roaming",
+// 	"Main City(First CellID)", "Sub City (First CellID)",
+// 	"Lat-Long-Azimuth (First CellID)",
+// 	"Crime", "Circle", "Operator", "LRN",
+// 	"CallForward", "B Party Provider", "B Party Circle",
+// 	"B Party Operator", "Type", "IMEI Manufacturer",
+// }
 
-var targetHeader = []string{
-	"CdrNo", "B Party", "Date", "Time", "Duration", "Call Type",
-	"First Cell ID", "First Cell ID Address", "Last Cell ID", "Last Cell ID Address",
-	"IMEI", "IMSI", "Roaming", "Main City(First CellID)", "Sub City (First CellID)",
-	"Lat-Long-Azimuth (First CellID)", "Crime", "Circle", "Operator", "LRN",
-	"CallForward", "B Party Provider", "B Party Circle", "B Party Operator",
-	"Type", "IMEI Manufacturer",
-}
+// /* ── tiny helpers ───────────────────────────────────────────────────────── */
+// var (
+// 	spaceRE  = regexp.MustCompile(`\s+`)
+// 	nonDigit = regexp.MustCompile(`\D`)
+// )
 
-/* ──────────── column-name synonyms (trim-and-lowered) ─────────────── */
+// func norm(s string) string { return spaceRE.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), " ") }
 
-var synonyms = map[string]string{
-	"b party no": "B Party", "called party telephone number": "B Party",
-	"date": "Date", "call date": "Date",
-	"time": "Time", "call time": "Time",
-	"dur(s)": "Duration", "call duration": "Duration",
-	"call type": "Call Type",
-	"imei": "IMEI", "imsi": "IMSI",
-	"roam nw": "Roaming", "roaming circle name": "Circle",
-	"circle": "Circle", "operator": "Operator",
-	"lrn": "LRN", "lrn called no": "LRN",
-	"call fow no": "CallForward", "call forwarding": "CallForward",
-	"lrn tsp-lsa": "B Party Provider", "b party provider": "B Party Provider",
-	"b party circle": "B Party Circle", "b party operator": "B Party Operator",
-	"service type": "Type",
-	"crime": "Crime",
-}
+// func colIdxAny(header []string, keys ...string) int {
+// 	for _, k := range keys {
+// 		if idx := colIdx(header, k); idx != -1 {
+// 			return idx
+// 		}
+// 	}
+// 	return -1
+// }
 
-/* ──────────── helpers ──────────── */
+// func colIdx(header []string, key string) int {
+// 	key = norm(key)
+// 	for i, h := range header {
+// 		if norm(h) == key {
+// 			return i
+// 		}
+// 	}
+// 	return -1
+// }
 
-var spaceRE = regexp.MustCompile(`\s+`)
-func norm(s string) string { return spaceRE.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), " ") }
+// /* ── “Search Value : 94xxxxxxxx” banner → CDR number ────────────────────── */
+// var searchValRE = regexp.MustCompile(`(?i)search\s*value[^0-9]*([0-9]{8,15})`)
 
-/* ──────────── CDR-number extraction ──────────── */
+// func extractCDR(line string) string {
+// 	if m := searchValRE.FindStringSubmatch(line); len(m) > 1 {
+// 		return m[1]
+// 	}
+// 	return ""
+// }
 
-var (
-	airtelCdrRE = regexp.MustCompile(`Mobile No '(\d+)'`)
-	jioCdrRE    = regexp.MustCompile(`Input Value : (\d+)`)
-	viCdrRE     = regexp.MustCompile(`MSISDN : - (\d+)`)
-)
+// /* ── embedded reference CSVs ────────────────────────────────────────────── */
+// //go:embed data/*
+// var dataFS embed.FS
 
-func extractCdrNumber(tsp, content string) string {
-	switch strings.ToLower(tsp) {
-	case "airtel":
-		if m := airtelCdrRE.FindStringSubmatch(content); len(m) > 1 { return m[1] }
-	case "jio":
-		if m := jioCdrRE.FindStringSubmatch(content); len(m) > 1 { return m[1] }
-	case "vi":
-		if m := viCdrRE.FindStringSubmatch(content); len(m) > 1 { return m[1] }
-	}
-	return ""
-}
+// /* ------------- BSNL cell-site DB ------------------- */
+// type CellInfo struct{ Addr, Sub, Main, LatLonAz string }
 
-/* ──────────── embedded cell-ID lookup ──────────── */
-//go:embed data/*
-var cellFS embed.FS
+// var cellDB = map[string]CellInfo{}
 
-type CellInfo struct {
-	Address        string
-	SubCity        string
-	MainCity       string
-	LatLongAzimuth string
-}
+// /* ------------- LRN DB ------------------------------ */
+// type LRNInfo struct{ Provider, Circle, Operator string }
 
-var cellDB = map[string]CellInfo{}
+// var lrnDB = map[string]LRNInfo{}
 
-func init() {
-	f, err := cellFS.Open("data/airtel_cells.csv")
-	if err != nil {
-		log.Fatalf("cell lookup file missing: %v", err)
-	}
-	r := csv.NewReader(f)
+// /* ── init: load reference data once at start --------- */
+// func init() {
+// 	loadCells("data/bsnl_cells.csv")
+// 	loadLRN("data/LRN.csv")
+// }
 
-	header, _ := r.Read()
-	hIdx := map[string]int{}
-	for i, h := range header {
-		hIdx[norm(h)] = i
-	}
+// /* load bsnl_cells.csv */
+// func loadCells(path string) {
+// 	f, err := dataFS.Open(path)
+// 	if err != nil {
+// 		log.Printf("warning: %s not found – cell enrichment disabled", path)
+// 		return
+// 	}
+// 	defer f.Close()
+// 	r := csv.NewReader(f)
+// 	header, _ := r.Read()
 
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) == 0 {
-			continue
-		}
-		id := strings.TrimSpace(rec[hIdx["cell id"]]) // 15-digit
-		if id == "" {
-			continue
-		}
-		cellDB[id] = CellInfo{
-			Address:        rec[hIdx["address"]],
-			SubCity:        rec[hIdx["subcity"]],
-			MainCity:       rec[hIdx["maincity"]],
-			LatLongAzimuth: rec[hIdx["latitude"]] + "," +
-				rec[hIdx["longitude"]] + "," +
-				rec[hIdx["azimuth"]],
-		}
-	}
-}
+// 	iCGI := colIdxAny(header, "cgi", "cell id", "cell_id")
+// 	iAddr := colIdxAny(header, "address")
+// 	iSub := colIdxAny(header, "subcity", "sub city")
+// 	iMain := colIdxAny(header, "maincity", "main city", "city")
+// 	iLat := colIdxAny(header, "latitude", "lat")
+// 	iLon := colIdxAny(header, "longitude", "lon", "long")
+// 	iAz := colIdxAny(header, "azimuth", "azm", "az")
 
-/* ──────────── HTTP endpoint ──────────── */
+// 	if iCGI == -1 {
+// 		log.Printf("warning: no CGI column in %s", path)
+// 		return
+// 	}
+// 	for {
+// 		rec, err := r.Read()
+// 		if err == io.EOF {
+// 			break
+// 		}
+// 		if err != nil || len(rec) == 0 {
+// 			continue
+// 		}
+// 		cgi := strings.TrimSpace(rec[iCGI])
+// 		if cgi == "" {
+// 			continue
+// 		}
+// 		cellDB[cgi] = CellInfo{
+// 			Addr:     pick(rec, iAddr),
+// 			Sub:      pick(rec, iSub),
+// 			Main:     pick(rec, iMain),
+// 			LatLonAz: buildLat(rec, iLat, iLon, iAz),
+// 		}
+// 		// digits-only key
+// 		cellDB[nonDigit.ReplaceAllString(cgi, "")] = cellDB[cgi]
+// 	}
+// }
 
-func UploadAndNormalizeCSV(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed); return
-	}
-	tsp   := strings.ToLower(r.FormValue("tsp_type"))
-	crime := r.FormValue("crime_number")
+// /* load LRN.csv */
+// func loadLRN(path string) {
+// 	f, err := dataFS.Open(path)
+// 	if err != nil {
+// 		log.Printf("warning: %s not found – provider/circle/operator blank", path)
+// 		return
+// 	}
+// 	defer f.Close()
+// 	r := csv.NewReader(f)
+// 	header, _ := r.Read()
 
-	file, hdr, err := r.FormFile("file")
-	if err != nil { http.Error(w, err.Error(), 400); return }
-	defer file.Close()
+// 	iLRN := colIdxAny(header, "lrn no", "lrn", "lrn number")
+// 	iTSP := colIdxAny(header, "tsp", "provider", "tsp-lsa")
+// 	iCircle := colIdxAny(header, "circle")
+// 	if iLRN == -1 {
+// 		log.Printf("warning: no LRN column in %s", path)
+// 		return
+// 	}
+// 	for {
+// 		rec, err := r.Read()
+// 		if err == io.EOF {
+// 			break
+// 		}
+// 		if err != nil || len(rec) == 0 {
+// 			continue
+// 		}
+// 		lrn := nonDigit.ReplaceAllString(rec[iLRN], "")
+// 		if lrn == "" {
+// 			continue
+// 		}
+// 		lrnDB[lrn] = LRNInfo{
+// 			Provider: pick(rec, iTSP),
+// 			Circle:   pick(rec, iCircle),
+// 			Operator: pick(rec, iTSP), // spec: Operator = tsp
+// 		}
+// 	}
+// }
 
-	for _, d := range []string{"uploads", "filtered"} {
-		if err := os.MkdirAll(d, 0755); err != nil {
-			http.Error(w, err.Error(), 500); return
-		}
-	}
-	src := filepath.Join("uploads", hdr.Filename)
-	dst := filepath.Join("filtered", "filtered_"+hdr.Filename)
-	if err := saveUploaded(file, src); err != nil {
-		http.Error(w, err.Error(), 500); return
-	}
+// /* ── misc helpers ───────────────────────────────────────────────────────── */
+// func pick(rec []string, idx int) string {
+// 	if idx == -1 || idx >= len(rec) {
+// 		return ""
+// 	}
+// 	return strings.TrimSpace(rec[idx])
+// }
+// func buildLat(rec []string, iLat, iLon, iAz int) string {
+// 	if iLat == -1 || iLon == -1 {
+// 		return ""
+// 	}
+// 	lat, lon := pick(rec, iLat), pick(rec, iLon)
+// 	if lat == "" || lon == "" {
+// 		return ""
+// 	}
+// 	if az := pick(rec, iAz); az != "" {
+// 		return lat + ", " + lon + ", " + az
+// 	}
+// 	return lat + ", " + lon
+// }
+// func cellLookup(id string) (CellInfo, bool) {
+// 	if info, ok := cellDB[id]; ok {
+// 		return info, true
+// 	}
+// 	return cellDB[nonDigit.ReplaceAllString(id, "")], cellDB[nonDigit.ReplaceAllString(id, "")].Addr != ""
+// }
 
-	switch tsp {
-	case "airtel":
-		if err := normalizeAirtel(src, dst, crime, tsp); err != nil {
-			http.Error(w, "normalization failed: "+err.Error(), 500); return
-		}
-	default:
-		http.Error(w, "unsupported tsp_type", 400); return
-	}
+// /* ── HTTP upload handler ────────────────────────────────────────────────── */
+// func UploadAndNormalizeCSV(w http.ResponseWriter, r *http.Request) {
+// 	if r.Method != http.MethodPost {
+// 		http.Error(w, "POST only", 405)
+// 		return
+// 	}
+// 	if strings.ToLower(r.FormValue("tsp_type")) != "bsnl" {
+// 		http.Error(w, "Only BSNL supported here", 400)
+// 		return
+// 	}
+// 	crime := r.FormValue("crime_number")
 
-	fmt.Fprintf(w, "Normalized file created: /download/%s\n", filepath.Base(dst))
-}
+// 	// ---- store upload ----------------------------------------------------
+// 	file, hdr, err := r.FormFile("file")
+// 	if err != nil {
+// 		http.Error(w, err.Error(), 400)
+// 		return
+// 	}
+// 	defer file.Close()
+// 	_ = os.MkdirAll("uploads", 0o755)
+// 	_ = os.MkdirAll("filtered", 0o755)
+// 	src := filepath.Join("uploads", hdr.Filename)
+// 	if err := save(file, src); err != nil {
+// 		http.Error(w, err.Error(), 500)
+// 		return
+// 	}
 
-func saveUploaded(src io.Reader, dst string) error {
-	f, err := os.Create(dst); if err != nil { return err }
-	defer f.Close()
-	_, err = io.Copy(f, src)
-	return err
-}
+// 	// ---- normalise -------------------------------------------------------
+// 	out, err := normBSNL(src, crime)
+// 	if err != nil {
+// 		http.Error(w, "normalisation failed: "+err.Error(), 500)
+// 		return
+// 	}
+// 	fmt.Fprintf(w, "/download/%s\n", filepath.Base(out))
+// }
 
-/* ──────────── Airtel normalizer ──────────── */
+// func save(r io.Reader, dst string) error {
+// 	f, err := os.Create(dst)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer f.Close()
+// 	_, err = io.Copy(f, r)
+// 	return err
+// }
 
-func cleanCGI(raw string) string { return strings.ReplaceAll(raw, "-", "") }
+// /* ── core normaliser ───────────────────────────────────────────────────── */
+// func normBSNL(src, crime string) (string, error) {
+// 	in, err := os.Open(src)
+// 	if err != nil {
+// 		return "", err
+// 	}
+// 	defer in.Close()
+// 	r := csv.NewReader(in)
 
-func enrichWithCell(row []string, col map[string]int, id string, first bool) {
-	info, ok := cellDB[id]
-	if !ok {
-		return
-	}
-	if first {
-		row[col["First Cell ID Address"]]            = info.Address
-		row[col["Sub City (First CellID)"]]          = info.SubCity
-		row[col["Main City(First CellID)"]]          = info.MainCity
-		row[col["Lat-Long-Azimuth (First CellID)"]]  = info.LatLongAzimuth
-	} else {
-		row[col["Last Cell ID Address"]] = info.Address
-	}
-}
+// 	/* 1. read until header row, extract CDR from banner -------------------- */
+// 	var header []string
+// 	var cdr string
+// 	for {
+// 		rec, err := r.Read()
+// 		if err == io.EOF {
+// 			return "", errors.New("no header found")
+// 		}
+// 		if err != nil {
+// 			continue
+// 		}
+// 		if cdr == "" {
+// 			cdr = extractCDR(strings.Join(rec, " "))
+// 		}
+// 		if colIdx(rec, "call_date") != -1 { // header located
+// 			header = rec
+// 			break
+// 		}
+// 	}
 
-func normalizeAirtel(src, dst, crime, tsp string) error {
-	in, err := os.Open(src)
-	if err != nil { return err }
-	defer in.Close()
-	r := csv.NewReader(in)
+// 	/* 2. get first data row to ensure CDR fallback works ------------------ */
+// 	firstData, err := r.Read()
+// 	if err != nil {
+// 		return "", errors.New("header present but file empty")
+// 	}
+// 	if cdr == "" {
+// 		if idx := colIdxAny(header, "search value"); idx != -1 && idx < len(firstData) {
+// 			cdr = nonDigit.ReplaceAllString(firstData[idx], "")
+// 		}
+// 	}
+// 	if cdr == "" {
+// 		cdr = nonDigit.ReplaceAllString(filepath.Base(src), "")
+// 	}
+// 	if cdr == "" {
+// 		return "", errors.New("CDR number not found")
+// 	}
 
-	/* ─── locate header + CDR number ─── */
-	var header []string
-	var cdrNumber string
-	for {
-		rec, err := r.Read()
-		if err == io.EOF { return fmt.Errorf("no header found") }
-		if err != nil { continue }
+// 	/* 3. locate every needed column -------------------------------------- */
+// 	idxDate := colIdx(header, "call_date")
+// 	idxTime := colIdxAny(header, "call_initiation_time(cit)", "call_initiation_time", "cit")
+// 	idxDur := colIdx(header, "call_duration")
+// 	idxBParty := colIdx(header, "other_party_no")
+// 	idxType := colIdx(header, "call_type")
+// 	idxFirstID := colIdx(header, "first_cell_id")
+// 	idxLastID := colIdx(header, "last_cell_id")
+// 	idxLastAddr := colIdx(header, "last_cell_desc")
+// 	idxIMEI := colIdx(header, "imei")
+// 	idxIMSI := colIdx(header, "imsi")
+// 	idxRoam := colIdxAny(header, "roaming circle", "roaming_circle")
+// 	idxLRN := colIdx(header, "lrn_b_party_no")
+// 	idxService := colIdx(header, "service_type")
 
-		if cdrNumber == "" && len(rec) > 0 {
-			cdrNumber = extractCdrNumber(tsp, rec[0])
-		}
-		if len(rec) > 0 && strings.Contains(rec[0], "Target No") {
-			header = rec; break
-		}
-	}
-	if cdrNumber == "" { return fmt.Errorf("could not extract CDR number") }
+// 	/* 4. prepare output writer ------------------------------------------- */
+// 	out := filepath.Join("filtered", cdr+"_reports.csv")
+// 	outF, _ := os.Create(out)
+// 	defer outF.Close()
+// 	w := csv.NewWriter(outF)
+// 	_ = w.Write(targetHeader)
 
-	/* ─── build column maps ─── */
-	srcToDst := map[int]int{}
-	col      := map[string]int{}        // every canonical column → index
-	for i, name := range targetHeader { col[name] = i }
+// 	col := map[string]int{}
+// 	for i, h := range targetHeader {
+// 		col[h] = i
+// 	}
+// 	blank := make([]string, len(targetHeader))
 
-	// first / last CGI in input
-	firstCGI, lastCGI := -1, -1
-	for i, h := range header {
-		hNorm := norm(h)
-		if hNorm == "first cgi" { firstCGI = i }
-		if hNorm == "last cgi"  { lastCGI  = i }
+// 	cp := func(rec []string, src int, dst string, row []string) {
+// 		if src >= 0 && src < len(rec) {
+// 			row[col[dst]] = strings.Trim(rec[src], "'\" ")
+// 		}
+// 	}
 
-		if canon, ok := synonyms[hNorm]; ok {
-			srcToDst[i] = col[canon]
-		}
-	}
-	if firstCGI == -1 || lastCGI == -1 {
-		return fmt.Errorf("CSV lacks First/Last CGI columns")
-	}
-	srcToDst[firstCGI] = col["First Cell ID"]
-	srcToDst[lastCGI]  = col["Last Cell ID"]
+// 	writeRow := func(rec []string) {
+// 		if len(rec) == 0 {
+// 			return
+// 		}
+// 		row := append([]string(nil), blank...)
+// 		row[col["CdrNo"]] = cdr
+// 		row[col["Crime"]] = crime
 
-	/* ─── output setup ─── */
-	out, _ := os.Create(dst)
-	defer out.Close()
-	w := csv.NewWriter(out)
-	_ = w.Write(targetHeader)
-	blank := make([]string, len(targetHeader))
+// 		cp(rec, idxDate, "Date", row)
+// 		cp(rec, idxTime, "Time", row)
+// 		cp(rec, idxDur, "Duration", row)
+// 		cp(rec, idxBParty, "B Party", row)
+// 		cp(rec, idxType, "Call Type", row)
+// 		cp(rec, idxFirstID, "First Cell ID", row)
+// 		cp(rec, idxLastID, "Last Cell ID", row)
+// 		cp(rec, idxLastAddr, "Last Cell ID Address", row)
+// 		cp(rec, idxIMEI, "IMEI", row)
+// 		cp(rec, idxIMSI, "IMSI", row)
+// 		cp(rec, idxRoam, "Roaming", row)
+// 		cp(rec, idxLRN, "LRN", row)
+// 		cp(rec, idxService, "Type", row)
 
-	skip := func(s string) bool {
-		s = strings.ToLower(strings.TrimSpace(s))
-		return strings.HasPrefix(s, "this is system") || strings.Contains(s, "system generated")
-	}
+// 		/* cell enrichment (first cell) */
+// 		if firstID := pick(rec, idxFirstID); firstID != "" {
+// 			if info, ok := cellLookup(firstID); ok {
+// 				row[col["First Cell ID Address"]] = info.Addr
+// 				row[col["Main City(First CellID)"]] = info.Main
+// 				row[col["Sub City (First CellID)"]] = info.Sub
+// 				row[col["Lat-Long-Azimuth (First CellID)"]] = info.LatLonAz
+// 			}
+// 		}
 
-	/* ─── stream records ─── */
-	for {
-		rec, err := r.Read()
-		if err == io.EOF { break }
-		if err != nil || len(rec) == 0 || skip(rec[0]) { continue }
+// 		/* provider / circle / operator via LRN */
+// 		if l := nonDigit.ReplaceAllString(pick(rec, idxLRN), ""); l != "" {
+// 			if info, ok := lrnDB[l]; ok {
+// 				row[col["B Party Provider"]] = info.Provider
+// 				row[col["B Party Circle"]] = info.Circle
+// 				row[col["B Party Operator"]] = info.Operator
+// 			}
+// 		}
 
-		row := append([]string(nil), blank...)
-		row[col["CdrNo"]] = cdrNumber
+// 		w.Write(row)
+// 	}
 
-		// copy simple fields
-		for s, d := range srcToDst {
-			if s >= len(rec) { continue }
-			v := strings.Trim(rec[s], "'\" ")
-			switch targetHeader[d] {
-			case "Call Type":
-				switch strings.ToUpper(v) {
-				case "IN", "A_IN":  v = "CALL_IN"
-				case "OUT", "A_OUT": v = "CALL_OUT"
-				}
-			case "Type":
-				if strings.EqualFold(v, "pre")  { v = "Prepaid" }
-				if strings.EqualFold(v, "post") { v = "Postpaid" }
-			}
-			row[d] = v
-		}
-
-		row[col["Crime"]] = crime
-
-		// clean & write CGI numbers
-		if first := cleanCGI(rec[firstCGI]); first != "" {
-			row[col["First Cell ID"]] = first
-		}
-		if last := cleanCGI(rec[lastCGI]); last != "" {
-			row[col["Last Cell ID"]] = last
-		}
-
-		// enrich with lookup
-		enrichWithCell(row, col, row[col["First Cell ID"]], true)
-		enrichWithCell(row, col, row[col["Last Cell ID"]],  false)
-
-		if err := w.Write(row); err != nil { return err }
-	}
-	w.Flush()
-	return w.Error()
-}
+// 	/* write first + remaining rows */
+// 	writeRow(firstData)
+// 	for {
+// 		rec, err := r.Read()
+// 		if err == io.EOF {
+// 			break
+// 		}
+// 		if err != nil || len(rec) == 0 {
+// 			continue
+// 		}
+// 		writeRow(rec)
+// 	}
+// 	w.Flush()
+// 	return out, w.Error()
+// }
