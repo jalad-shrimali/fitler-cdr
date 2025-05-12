@@ -308,7 +308,7 @@ func normalizeAirtel(src, dstDir, crime string) (filteredPath, summaryPath strin
 			fmt.Sprint(len(a.Days)),fmt.Sprint(len(a.Cells)),
 			fmt.Sprint(len(a.Imeis)),fmt.Sprint(len(a.Imsis)),
 			a.First,a.Last,
-		})
+		}) 
 	}
 	sw.Flush()
 
