@@ -1,382 +1,412 @@
 package main
 
-// import (
-// 	"embed"
-// 	"encoding/csv"
-// 	"errors"
-// 	"fmt"
-// 	"io"
-// 	"log"
-// 	"net/http"
-// 	"os"
-// 	"path/filepath"
-// 	"regexp"
-// 	"strings"
-// )
+import (
+	"embed"
+	"encoding/csv"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
 
-// /* ── canonical 26-column output header (DO NOT CHANGE ORDER) ────────────── */
-// var targetHeader = []string{
-// 	"CdrNo", "B Party", "Date", "Time", "Duration", "Call Type",
-// 	"First Cell ID", "First Cell ID Address",
-// 	"Last Cell ID", "Last Cell ID Address",
-// 	"IMEI", "IMSI", "Roaming",
-// 	"Main City(First CellID)", "Sub City (First CellID)",
-// 	"Lat-Long-Azimuth (First CellID)",
-// 	"Crime", "Circle", "Operator", "LRN",
-// 	"CallForward", "B Party Provider", "B Party Circle",
-// 	"B Party Operator", "Type", "IMEI Manufacturer",
-// }
+/* ───────── canonical 26‑column layout for filtered output ───────── */
+var targetHeader = []string{
+	"CdrNo", "B Party", "Date", "Time", "Duration", "Call Type",
+	"First Cell ID", "First Cell ID Address", "Last Cell ID", "Last Cell ID Address",
+	"IMEI", "IMSI", "Roaming",
+	"Main City(First CellID)", "Sub City (First CellID)", "Lat-Long-Azimuth (First CellID)",
+	"Crime", "Circle", "Operator", "LRN",
+	"CallForward", "B Party Provider", "B Party Circle", "B Party Operator",
+	"Type", "IMEI Manufacturer",
+}
 
-// /* ── tiny helpers ───────────────────────────────────────────────────────── */
-// var (
-// 	spaceRE  = regexp.MustCompile(`\s+`)
-// 	nonDigit = regexp.MustCompile(`\D`)
-// )
+/* ───────── helpers ───────── */
+var (
+	spaceRE  = regexp.MustCompile(`\s+`)
+	nonDigit = regexp.MustCompile(`\D`)
+)
+func norm(s string) string { return spaceRE.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), " ") }
+func digits(s string) string { return nonDigit.ReplaceAllString(s, "") }
+func last10(s string) string { d := digits(s); if len(d) > 10 { return d[len(d)-10:] }; return d }
+func cleanCGI(s string) string { return digits(s) }
 
-// func norm(s string) string { return spaceRE.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), " ") }
+/* column index helpers */
+func colIdxAny(header []string, keys ...string) int {
+	for _, k := range keys {
+		for i, h := range header {
+			if norm(h) == norm(k) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+func colIdx(header []string, key string) int { return colIdxAny(header, key) }
 
-// func colIdxAny(header []string, keys ...string) int {
-// 	for _, k := range keys {
-// 		if idx := colIdx(header, k); idx != -1 {
-// 			return idx
-// 		}
-// 	}
-// 	return -1
-// }
+/* ───────── banner‑line CDR extractor ───────── */
+var jioCdrRE = regexp.MustCompile(`(?i)input value[^0-9]*([0-9]{8,15})`)
+func extractCdrNumber(line string) string {
+	if m := jioCdrRE.FindStringSubmatch(line); len(m) > 1 { return m[1] }
+	return ""
+}
 
-// func colIdx(header []string, key string) int {
-// 	key = norm(key)
-// 	for i, h := range header {
-// 		if norm(h) == key {
-// 			return i
-// 		}
-// 	}
-// 	return -1
-// }
+/* ───────── embedded lookup data ───────── */
+//go:embed data/*
+var dataFS embed.FS
 
-// /* ── “Search Value : 94xxxxxxxx” banner → CDR number ────────────────────── */
-// var searchValRE = regexp.MustCompile(`(?i)search\s*value[^0-9]*([0-9]{8,15})`)
+type CellInfo struct{ Addr, Sub, Main, LatLonAz string }
+type LRNInfo  struct{ Provider, Circle, Operator string }
 
-// func extractCDR(line string) string {
-// 	if m := searchValRE.FindStringSubmatch(line); len(m) > 1 {
-// 		return m[1]
-// 	}
-// 	return ""
-// }
+var (
+	cellDB = map[string]map[string]CellInfo{} // tsp → map[cellID]info
+	lrnDB  = map[string]LRNInfo{}             // digits(LRN) → info
+)
 
-// /* ── embedded reference CSVs ────────────────────────────────────────────── */
-// //go:embed data/*
-// var dataFS embed.FS
+func init() {
+	if err := loadCells("jio", "data/jio_cells.csv"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Fatalf("cell DB: %v", err)
+	}
+	if err := loadLRN("data/LRN.csv"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("LRN.csv not loaded: %v (provider/circle columns will be blank)", err)
+	}
+}
 
-// /* ------------- BSNL cell-site DB ------------------- */
-// type CellInfo struct{ Addr, Sub, Main, LatLonAz string }
+/* ---------- loadCells ---------- */
+func loadCells(tsp, path string) error {
+	f, err := dataFS.Open(path)
+	if err != nil { return err }
+	defer f.Close()
 
-// var cellDB = map[string]CellInfo{}
+	r := csv.NewReader(f)
+	header, err := r.Read(); if err != nil { return err }
+	idx := func(keys ...string) int { return colIdxAny(header, keys...) }
 
-// /* ------------- LRN DB ------------------------------ */
-// type LRNInfo struct{ Provider, Circle, Operator string }
+	iID := idx("cgi", "cell id")
+	iAddr, iSub := idx("address"), idx("subcity", "sub city")
+	iMain := idx("maincity", "city")
+	iLat, iLon, iAz := idx("latitude"), idx("longitude", "lon"), idx("azimuth", "az")
+	if iID == -1 { return fmt.Errorf("no CGI column in %s", path) }
 
-// var lrnDB = map[string]LRNInfo{}
+	cellDB[tsp] = map[string]CellInfo{}
+	for {
+		rec, err := r.Read()
+		if err == io.EOF { break }
+		if err != nil || len(rec) == 0 { continue }
 
-// /* ── init: load reference data once at start --------- */
-// func init() {
-// 	loadCells("data/bsnl_cells.csv")
-// 	loadLRN("data/LRN.csv")
-// }
+		raw := strings.TrimSpace(rec[iID]); if raw == "" { continue }
+		info := CellInfo{
+			Addr:     pick(rec, iAddr),
+			Sub:      pick(rec, iSub),
+			Main:     pick(rec, iMain),
+			LatLonAz: buildLat(rec, iLat, iLon, iAz),
+		}
+		cellDB[tsp][raw]        = info
+		cellDB[tsp][digits(raw)] = info
+	}
+	return nil
+}
 
-// /* load bsnl_cells.csv */
-// func loadCells(path string) {
-// 	f, err := dataFS.Open(path)
-// 	if err != nil {
-// 		log.Printf("warning: %s not found – cell enrichment disabled", path)
-// 		return
-// 	}
-// 	defer f.Close()
-// 	r := csv.NewReader(f)
-// 	header, _ := r.Read()
+/* ---------- loadLRN ---------- */
+func loadLRN(path string) error {
+	f, err := dataFS.Open(path)
+	if err != nil { return err }
+	defer f.Close()
 
-// 	iCGI := colIdxAny(header, "cgi", "cell id", "cell_id")
-// 	iAddr := colIdxAny(header, "address")
-// 	iSub := colIdxAny(header, "subcity", "sub city")
-// 	iMain := colIdxAny(header, "maincity", "main city", "city")
-// 	iLat := colIdxAny(header, "latitude", "lat")
-// 	iLon := colIdxAny(header, "longitude", "lon", "long")
-// 	iAz := colIdxAny(header, "azimuth", "azm", "az")
+	r := csv.NewReader(f)
+	header, err := r.Read(); if err != nil { return err }
 
-// 	if iCGI == -1 {
-// 		log.Printf("warning: no CGI column in %s", path)
-// 		return
-// 	}
-// 	for {
-// 		rec, err := r.Read()
-// 		if err == io.EOF {
-// 			break
-// 		}
-// 		if err != nil || len(rec) == 0 {
-// 			continue
-// 		}
-// 		cgi := strings.TrimSpace(rec[iCGI])
-// 		if cgi == "" {
-// 			continue
-// 		}
-// 		cellDB[cgi] = CellInfo{
-// 			Addr:     pick(rec, iAddr),
-// 			Sub:      pick(rec, iSub),
-// 			Main:     pick(rec, iMain),
-// 			LatLonAz: buildLat(rec, iLat, iLon, iAz),
-// 		}
-// 		// digits-only key
-// 		cellDB[nonDigit.ReplaceAllString(cgi, "")] = cellDB[cgi]
-// 	}
-// }
+	iLRN   := colIdxAny(header, "lrn", "lrn no")
+	iTSP   := colIdxAny(header, "tsp", "provider")
+	iCircle:= colIdx(header, "circle")
+	if iLRN == -1 || iTSP == -1 { return fmt.Errorf("LRN.csv missing columns") }
 
-// /* load LRN.csv */
-// func loadLRN(path string) {
-// 	f, err := dataFS.Open(path)
-// 	if err != nil {
-// 		log.Printf("warning: %s not found – provider/circle/operator blank", path)
-// 		return
-// 	}
-// 	defer f.Close()
-// 	r := csv.NewReader(f)
-// 	header, _ := r.Read()
+	for {
+		rec, err := r.Read()
+		if err == io.EOF { break }
+		if err != nil || len(rec) == 0 { continue }
 
-// 	iLRN := colIdxAny(header, "lrn no", "lrn", "lrn number")
-// 	iTSP := colIdxAny(header, "tsp", "provider", "tsp-lsa")
-// 	iCircle := colIdxAny(header, "circle")
-// 	if iLRN == -1 {
-// 		log.Printf("warning: no LRN column in %s", path)
-// 		return
-// 	}
-// 	for {
-// 		rec, err := r.Read()
-// 		if err == io.EOF {
-// 			break
-// 		}
-// 		if err != nil || len(rec) == 0 {
-// 			continue
-// 		}
-// 		lrn := nonDigit.ReplaceAllString(rec[iLRN], "")
-// 		if lrn == "" {
-// 			continue
-// 		}
-// 		lrnDB[lrn] = LRNInfo{
-// 			Provider: pick(rec, iTSP),
-// 			Circle:   pick(rec, iCircle),
-// 			Operator: pick(rec, iTSP), // spec: Operator = tsp
-// 		}
-// 	}
-// }
+		key := digits(rec[iLRN]); if key == "" { continue }
+		lrnDB[key] = LRNInfo{
+			Provider: pick(rec, iTSP),
+			Circle:   pick(rec, iCircle),
+			Operator: pick(rec, iTSP), // requirement: operator == provider
+		}
+	}
+	return nil
+}
 
-// /* ── misc helpers ───────────────────────────────────────────────────────── */
-// func pick(rec []string, idx int) string {
-// 	if idx == -1 || idx >= len(rec) {
-// 		return ""
-// 	}
-// 	return strings.TrimSpace(rec[idx])
-// }
-// func buildLat(rec []string, iLat, iLon, iAz int) string {
-// 	if iLat == -1 || iLon == -1 {
-// 		return ""
-// 	}
-// 	lat, lon := pick(rec, iLat), pick(rec, iLon)
-// 	if lat == "" || lon == "" {
-// 		return ""
-// 	}
-// 	if az := pick(rec, iAz); az != "" {
-// 		return lat + ", " + lon + ", " + az
-// 	}
-// 	return lat + ", " + lon
-// }
-// func cellLookup(id string) (CellInfo, bool) {
-// 	if info, ok := cellDB[id]; ok {
-// 		return info, true
-// 	}
-// 	return cellDB[nonDigit.ReplaceAllString(id, "")], cellDB[nonDigit.ReplaceAllString(id, "")].Addr != ""
-// }
+/* misc helpers */
+func pick(rec []string, idx int) string {
+	if idx == -1 || idx >= len(rec) { return "" }
+	return strings.TrimSpace(rec[idx])
+}
+func buildLat(rec []string, iLat, iLon, iAz int) string {
+	if iLat == -1 || iLon == -1 { return "" }
+	lat, lon := pick(rec, iLat), pick(rec, iLon)
+	if lat == "" || lon == "" { return "" }
+	if az := pick(rec, iAz); az != "" { return lat + ", " + lon + ", " + az }
+	return lat + ", " + lon
+}
+func findCell(tsp, id string) (CellInfo, bool) {
+	db := cellDB[tsp]
+	if info, ok := db[id]; ok { return info, true }
+	if info, ok := db[digits(id)]; ok { return info, true }
+	return CellInfo{}, false
+}
 
-// /* ── HTTP upload handler ────────────────────────────────────────────────── */
-// func UploadAndNormalizeCSV(w http.ResponseWriter, r *http.Request) {
-// 	if r.Method != http.MethodPost {
-// 		http.Error(w, "POST only", 405)
-// 		return
-// 	}
-// 	if strings.ToLower(r.FormValue("tsp_type")) != "bsnl" {
-// 		http.Error(w, "Only BSNL supported here", 400)
-// 		return
-// 	}
-// 	crime := r.FormValue("crime_number")
+/* ───────────────────── HTTP handler ───────────────────── */
+func UploadAndNormalizeCSV(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost { http.Error(w, "POST only", 405); return }
+	if strings.ToLower(r.FormValue("tsp_type")) != "jio" {
+		http.Error(w, "Only Jio supported", 400); return
+	}
+	crime := r.FormValue("crime_number")
 
-// 	// ---- store upload ----------------------------------------------------
-// 	file, hdr, err := r.FormFile("file")
-// 	if err != nil {
-// 		http.Error(w, err.Error(), 400)
-// 		return
-// 	}
-// 	defer file.Close()
-// 	_ = os.MkdirAll("uploads", 0o755)
-// 	_ = os.MkdirAll("filtered", 0o755)
-// 	src := filepath.Join("uploads", hdr.Filename)
-// 	if err := save(file, src); err != nil {
-// 		http.Error(w, err.Error(), 500)
-// 		return
-// 	}
+	fh, hdr, err := r.FormFile("file")
+	if err != nil { http.Error(w, err.Error(), 400); return }
+	defer fh.Close()
 
-// 	// ---- normalise -------------------------------------------------------
-// 	out, err := normBSNL(src, crime)
-// 	if err != nil {
-// 		http.Error(w, "normalisation failed: "+err.Error(), 500)
-// 		return
-// 	}
-// 	fmt.Fprintf(w, "/download/%s\n", filepath.Base(out))
-// }
+	_ = os.MkdirAll("uploads", 0o755)
+	_ = os.MkdirAll("filtered", 0o755)
 
-// func save(r io.Reader, dst string) error {
-// 	f, err := os.Create(dst)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer f.Close()
-// 	_, err = io.Copy(f, r)
-// 	return err
-// }
+	src := filepath.Join("uploads", hdr.Filename)
+	if err := saveUploaded(fh, src); err != nil { http.Error(w, err.Error(), 500); return }
 
-// /* ── core normaliser ───────────────────────────────────────────────────── */
-// func normBSNL(src, crime string) (string, error) {
-// 	in, err := os.Open(src)
-// 	if err != nil {
-// 		return "", err
-// 	}
-// 	defer in.Close()
-// 	r := csv.NewReader(in)
+	filtered, summary, err := normJio(src, crime)
+	if err != nil { http.Error(w, err.Error(), 500); return }
 
-// 	/* 1. read until header row, extract CDR from banner -------------------- */
-// 	var header []string
-// 	var cdr string
-// 	for {
-// 		rec, err := r.Read()
-// 		if err == io.EOF {
-// 			return "", errors.New("no header found")
-// 		}
-// 		if err != nil {
-// 			continue
-// 		}
-// 		if cdr == "" {
-// 			cdr = extractCDR(strings.Join(rec, " "))
-// 		}
-// 		if colIdx(rec, "call_date") != -1 { // header located
-// 			header = rec
-// 			break
-// 		}
-// 	}
+	fmt.Fprintf(w, "/download/%s\n/download/%s\n", filepath.Base(filtered), filepath.Base(summary))
+}
 
-// 	/* 2. get first data row to ensure CDR fallback works ------------------ */
-// 	firstData, err := r.Read()
-// 	if err != nil {
-// 		return "", errors.New("header present but file empty")
-// 	}
-// 	if cdr == "" {
-// 		if idx := colIdxAny(header, "search value"); idx != -1 && idx < len(firstData) {
-// 			cdr = nonDigit.ReplaceAllString(firstData[idx], "")
-// 		}
-// 	}
-// 	if cdr == "" {
-// 		cdr = nonDigit.ReplaceAllString(filepath.Base(src), "")
-// 	}
-// 	if cdr == "" {
-// 		return "", errors.New("CDR number not found")
-// 	}
+func saveUploaded(r io.Reader, dst string) error {
+	f, err := os.Create(dst); if err != nil { return err }
+	defer f.Close()
+	_, err = io.Copy(f, r)
+	return err
+}
 
-// 	/* 3. locate every needed column -------------------------------------- */
-// 	idxDate := colIdx(header, "call_date")
-// 	idxTime := colIdxAny(header, "call_initiation_time(cit)", "call_initiation_time", "cit")
-// 	idxDur := colIdx(header, "call_duration")
-// 	idxBParty := colIdx(header, "other_party_no")
-// 	idxType := colIdx(header, "call_type")
-// 	idxFirstID := colIdx(header, "first_cell_id")
-// 	idxLastID := colIdx(header, "last_cell_id")
-// 	idxLastAddr := colIdx(header, "last_cell_desc")
-// 	idxIMEI := colIdx(header, "imei")
-// 	idxIMSI := colIdx(header, "imsi")
-// 	idxRoam := colIdxAny(header, "roaming circle", "roaming_circle")
-// 	idxLRN := colIdx(header, "lrn_b_party_no")
-// 	idxService := colIdx(header, "service_type")
+/* ───────── enrichment for cell address columns ───────── */
+func enrich(row []string, col map[string]int, id string, first bool) {
+	if info, ok := findCell("jio", id); ok {
+		if first {
+			row[col["First Cell ID Address"]]          = info.Addr
+			row[col["Sub City (First CellID)"]]        = info.Sub
+			row[col["Main City(First CellID)"]]        = info.Main
+			row[col["Lat-Long-Azimuth (First CellID)"]] = info.LatLonAz
+		} else {
+			row[col["Last Cell ID Address"]] = info.Addr
+		}
+	}
+}
 
-// 	/* 4. prepare output writer ------------------------------------------- */
-// 	out := filepath.Join("filtered", cdr+"_reports.csv")
-// 	outF, _ := os.Create(out)
-// 	defer outF.Close()
-// 	w := csv.NewWriter(outF)
-// 	_ = w.Write(targetHeader)
+/* ─────────────────── Jio normaliser (filtered + per‑party summary) ───── */
+func normJio(src, crime string) (filteredPath, summaryPath string, err error) {
+	in, err := os.Open(src); if err != nil { return "", "", err }
+	defer in.Close()
+	r := csv.NewReader(in)
 
-// 	col := map[string]int{}
-// 	for i, h := range targetHeader {
-// 		col[h] = i
-// 	}
-// 	blank := make([]string, len(targetHeader))
+	/* ── locate header row & essential indexes ── */
+	var (
+		header                                                []string
+		cdr                                                   string
+		iFirst, iLast, iCalling, iCalled, iInput             = -1, -1, -1, -1, -1
+	)
+	for {
+		rec, er := r.Read()
+		if er == io.EOF { return "", "", errors.New("no header") }
+		if er != nil { continue }
 
-// 	cp := func(rec []string, src int, dst string, row []string) {
-// 		if src >= 0 && src < len(rec) {
-// 			row[col[dst]] = strings.Trim(rec[src], "'\" ")
-// 		}
-// 	}
+		if cdr == "" { cdr = extractCdrNumber(strings.Join(rec, " ")) }
 
-// 	writeRow := func(rec []string) {
-// 		if len(rec) == 0 {
-// 			return
-// 		}
-// 		row := append([]string(nil), blank...)
-// 		row[col["CdrNo"]] = cdr
-// 		row[col["Crime"]] = crime
+		for i, h := range rec {
+			switch norm(h) {
+			case "first cgi", "first cell id": iFirst = i
+			case "last cgi",  "last cell id":  iLast  = i
+			case "calling party telephone number": iCalling = i
+			case "called party telephone number":  iCalled  = i
+			}
+			if strings.Contains(strings.ToLower(h), "input value") { iInput = i }
+		}
+		if iFirst != -1 && iLast != -1 { header = rec; break }
+	}
 
-// 		cp(rec, idxDate, "Date", row)
-// 		cp(rec, idxTime, "Time", row)
-// 		cp(rec, idxDur, "Duration", row)
-// 		cp(rec, idxBParty, "B Party", row)
-// 		cp(rec, idxType, "Call Type", row)
-// 		cp(rec, idxFirstID, "First Cell ID", row)
-// 		cp(rec, idxLastID, "Last Cell ID", row)
-// 		cp(rec, idxLastAddr, "Last Cell ID Address", row)
-// 		cp(rec, idxIMEI, "IMEI", row)
-// 		cp(rec, idxIMSI, "IMSI", row)
-// 		cp(rec, idxRoam, "Roaming", row)
-// 		cp(rec, idxLRN, "LRN", row)
-// 		cp(rec, idxService, "Type", row)
+	/* fallback CDR from first data line, if needed */
+	var firstRec []string
+	if cdr == "" && iInput != -1 {
+		firstRec, _ = r.Read()
+		if len(firstRec) > iInput {
+			if m := regexp.MustCompile(`\d{8,15}`).FindString(firstRec[iInput]); m != "" { cdr = m }
+		}
+	}
+	if cdr == "" { return "", "", errors.New("CDR not found") }
+	cdr10 := last10(cdr)
 
-// 		/* cell enrichment (first cell) */
-// 		if firstID := pick(rec, idxFirstID); firstID != "" {
-// 			if info, ok := cellLookup(firstID); ok {
-// 				row[col["First Cell ID Address"]] = info.Addr
-// 				row[col["Main City(First CellID)"]] = info.Main
-// 				row[col["Sub City (First CellID)"]] = info.Sub
-// 				row[col["Lat-Long-Azimuth (First CellID)"]] = info.LatLonAz
-// 			}
-// 		}
+	/* -------- filtered writer -------- */
+	filteredPath = filepath.Join("filtered", cdr+"_reports.csv")
+	fout, _ := os.Create(filteredPath)
+	defer fout.Close()
+	fw := csv.NewWriter(fout)
+	_ = fw.Write(targetHeader)
 
-// 		/* provider / circle / operator via LRN */
-// 		if l := nonDigit.ReplaceAllString(pick(rec, idxLRN), ""); l != "" {
-// 			if info, ok := lrnDB[l]; ok {
-// 				row[col["B Party Provider"]] = info.Provider
-// 				row[col["B Party Circle"]] = info.Circle
-// 				row[col["B Party Operator"]] = info.Operator
-// 			}
-// 		}
+	col := make(map[string]int)
+	for i, h := range targetHeader { col[h] = i }
+	blank := make([]string, len(targetHeader))
 
-// 		w.Write(row)
-// 	}
+	/* -------- multi‑party summary aggregator -------- */
+	type agg struct {
+		BParty, SDR, Provider, Type           string
+		TotalCalls, OutCalls, InCalls         int
+		OutSMS, InSMS, OtherCalls             int
+		RoamCalls, RoamSMS                    int
+		TotalDuration                         float64
+		Days, CellIds, Imeis, Imsis           map[string]struct{}
+		FirstCall, LastCall                   string
+	}
+	summary := map[string]*agg{}
+	timeLayout := "2006-01-02 15:04:05"
+	parseDT := func(d, t string) string {
+		dt := strings.TrimSpace(d) + " " + strings.TrimSpace(t)
+		if _, e := time.Parse(timeLayout, dt); e == nil { return dt }
+		return dt
+	}
 
-// 	/* write first + remaining rows */
-// 	writeRow(firstData)
-// 	for {
-// 		rec, err := r.Read()
-// 		if err == io.EOF {
-// 			break
-// 		}
-// 		if err != nil || len(rec) == 0 {
-// 			continue
-// 		}
-// 		writeRow(rec)
-// 	}
-// 	w.Flush()
-// 	return out, w.Error()
-// }
+	cp := func(rec []string, src int, dst string, row []string) {
+		if src >= 0 && src < len(rec) { row[col[dst]] = strings.Trim(rec[src], "'\" ") }
+	}
+
+	writeRow := func(rec []string) {
+		if len(rec) == 0 { return }
+
+		row := append([]string(nil), blank...)
+		row[col["CdrNo"]] = cdr
+
+		iDate := colIdx(header, "call date")
+		iTime := colIdx(header, "call time")
+		iDur  := colIdxAny(header, "dur(s)", "duration(sec)", "call duration")
+		iIMEI := colIdx(header, "imei")
+		iIMSI := colIdx(header, "imsi")
+		iLRN  := colIdxAny(header, "lrn called no", "lrn no", "lrn")
+		iRoam := colIdx(header, "roaming circle name")
+		iCT   := colIdx(header, "call type")
+
+		cp(rec, iDate, "Date", row); cp(rec, iTime, "Time", row)
+		cp(rec, iDur,  "Duration", row)
+		cp(rec, iIMEI, "IMEI", row); cp(rec, iIMSI, "IMSI", row)
+		cp(rec, iLRN,  "LRN",  row)
+		cp(rec, colIdxAny(header, "call forward", "call fwd no", "call fow no"), "CallForward", row)
+		cp(rec, iRoam, "Roaming", row)
+
+		switch ct := strings.ToUpper(strings.Trim(rec[iCT], "'\" ")); ct {
+		case "A_IN", "CALL_IN":  row[col["Call Type"]] = "CALL_IN"
+		case "A_OUT", "CALL_OUT": row[col["Call Type"]] = "CALL_OUT"
+		default: row[col["Call Type"]] = ct
+		}
+		row[col["Crime"]] = crime
+
+		firstID := cleanCGI(rec[iFirst]); lastID := cleanCGI(rec[iLast])
+		row[col["First Cell ID"]] = firstID; row[col["Last Cell ID"]] = lastID
+		enrich(row, col, firstID, true); enrich(row, col, lastID, false)
+
+		callRaw, calledRaw := strings.Trim(rec[iCalling], "'\" "), strings.Trim(rec[iCalled], "'\" ")
+		switch {
+		case last10(callRaw) == cdr10 && calledRaw != "": row[col["B Party"]] = calledRaw
+		case last10(calledRaw) == cdr10 && callRaw != "": row[col["B Party"]] = callRaw
+		default:
+			if calledRaw != "" { row[col["B Party"]] = calledRaw } else { row[col["B Party"]] = callRaw }
+		}
+		bKey := row[col["B Party"]]
+		if bKey == "" { bKey = "(blank)" }
+
+		if info, ok := lrnDB[digits(row[col["LRN"]])]; ok {
+			row[col["B Party Provider"]] = info.Provider
+			row[col["B Party Circle"]]   = info.Circle
+			row[col["B Party Operator"]] = info.Operator
+		}
+
+		fw.Write(row)
+
+		/* ---- update / create aggregator ---- */
+		a, ok := summary[bKey]
+		if !ok {
+			a = &agg{
+				BParty: bKey, SDR: row[col["B Party Operator"]],
+				Provider: row[col["B Party Provider"]],
+				Type: row[col["Type"]],
+				Days: map[string]struct{}{}, CellIds: map[string]struct{}{},
+				Imeis: map[string]struct{}{}, Imsis: map[string]struct{}{},
+			}
+			summary[bKey] = a
+		}
+
+		a.TotalCalls++
+		switch row[col["Call Type"]] {
+		case "CALL_OUT": a.OutCalls++
+		case "CALL_IN":  a.InCalls++
+		default:
+			if strings.Contains(row[col["Call Type"]], "SMS") {
+				if strings.HasSuffix(row[col["Call Type"]], "OUT") { a.OutSMS++ } else { a.InSMS++ }
+			} else { a.OtherCalls++ }
+		}
+		if row[col["Roaming"]] != "" {
+			if strings.Contains(row[col["Call Type"]], "SMS") { a.RoamSMS++ } else { a.RoamCalls++ }
+		}
+		if dur, er := strconv.ParseFloat(row[col["Duration"]], 64); er == nil { a.TotalDuration += dur }
+
+		a.Days[row[col["Date"]]] = struct{}{}
+		if firstID != "" { a.CellIds[firstID] = struct{}{} }
+		if lastID  != "" { a.CellIds[lastID]  = struct{}{} }
+		if v := row[col["IMEI"]]; v != "" { a.Imeis[v] = struct{}{} }
+		if v := row[col["IMSI"]]; v != "" { a.Imsis[v] = struct{}{} }
+
+		dt := parseDT(row[col["Date"]], row[col["Time"]])
+		if a.FirstCall == "" || dt < a.FirstCall { a.FirstCall = dt }
+		if a.LastCall  == "" || dt > a.LastCall  { a.LastCall  = dt }
+	}
+
+	/* -------- iterate through CSV -------- */
+	if len(firstRec) > 0 { writeRow(firstRec) }
+	for {
+		rec, er := r.Read()
+		if er == io.EOF { break }
+		if er != nil || len(rec) == 0 { continue }
+		writeRow(rec)
+	}
+	fw.Flush()
+
+	/* -------- write summary file -------- */
+	summaryPath = filepath.Join("filtered", cdr+"_summary_reports.csv")
+	sout, _ := os.Create(summaryPath)
+	defer sout.Close()
+	sw := csv.NewWriter(sout)
+	sw.Write([]string{
+		"CdrNo", "B Party", "B Party SDR", "Provider", "Type",
+		"Total Calls", "Out Calls", "In Calls", "Out Sms", "In Sms",
+		"Other Calls", "Roam Calls", "Roam Sms", "Total Duration",
+		"Total Days", "Total CellIds", "Total Imei", "Total Imsi",
+		"First Call", "Last Call",
+	})
+	for _, a := range summary {
+		sw.Write([]string{
+			cdr, a.BParty, a.SDR, a.Provider, a.Type,
+			fmt.Sprint(a.TotalCalls), fmt.Sprint(a.OutCalls), fmt.Sprint(a.InCalls),
+			fmt.Sprint(a.OutSMS), fmt.Sprint(a.InSMS), fmt.Sprint(a.OtherCalls),
+			fmt.Sprint(a.RoamCalls), fmt.Sprint(a.RoamSMS),
+			fmt.Sprintf("%.0f", a.TotalDuration),
+			fmt.Sprint(len(a.Days)), fmt.Sprint(len(a.CellIds)),
+			fmt.Sprint(len(a.Imeis)), fmt.Sprint(len(a.Imsis)),
+			a.FirstCall, a.LastCall,
+		})
+	}
+	sw.Flush()
+
+	return filteredPath, summaryPath, nil
+}
+
+/* ─────────────────────────────────────────────────────────── */
