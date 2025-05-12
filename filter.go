@@ -47,7 +47,7 @@ func colIdxAny(header []string, keys ...string) int {
 		}
 	}
 	return -1
-}
+} 
 func colIdx(header []string, key string) int { return colIdxAny(header, key) }
 
 /* ───────── banner‑line CDR extractor ───────── */
