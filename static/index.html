@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CDR Normalizer</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@picocss/pico@latest/css/pico.min.css"
+    />
+    <style>
+      body {
+        max-width: 720px;
+        margin: auto;
+        padding: 2rem;
+      }
+      #links a {
+        display: block;
+        margin: 0.5rem 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>CDR Normalizer</h1>
+
+    <!-- ① Native form submission works without JS, thanks to action+method. -->
+    <form
+      id="uploadForm"
+      action="/upload"
+      method="post"
+      enctype="multipart/form-data"
+    >
+      <label>
+        Choose CDR CSV
+        <input type="file" name="file" accept=".csv" required />
+      </label>
+
+      <label>
+        Telecom Service Provider
+        <select name="tsp_type" required>
+          <option value="" hidden>Select TSP</option>
+          <option value="airtel">Airtel</option>
+          <option value="bsnl">BSNL</option>
+          <option value="jio">Jio</option>
+          <option value="vi">VI</option>
+        </select>
+      </label>
+
+      <label>
+        Crime / Case Number
+        <input type="text" name="crime_number" placeholder="e.g. FIR‑123/24" />
+      </label>
+
+      <button type="submit">Upload &amp; Generate</button>
+    </form>
+
+    <article id="result" style="display: none">
+      <h2>Download</h2>
+      <div id="links"></div>
+    </article>
+
+    <script>
+      // Enhance the native form with fetch – progressive enhancement style.
+      document
+        .getElementById("uploadForm")
+        .addEventListener("submit", async (e) => {
+          e.preventDefault();
+          const form = e.currentTarget;
+          const btn = form.querySelector('button[type="submit"]');
+          btn.disabled = true;
+          btn.textContent = "Uploading…";
+
+          try {
+            const data = new FormData(form);
+            const res = await fetch("http://localhost:8080/upload", {
+              method: "POST",
+              body: data,
+            });
+            console.log("Response:", res);
+            const linksDiv = document.getElementById("links");
+            linksDiv.innerHTML = "";
+
+            if (!res.ok) {
+              linksDiv.textContent = await res.text();
+              document.getElementById("result").style.display = "";
+              return;
+            }
+
+            const paths = (await res.text())
+              .trim()
+              .split(/\r?\n/)
+              .filter(Boolean);
+            paths.forEach((p) => {
+              const a = document.createElement("a");
+              a.href = p;
+              a.textContent = p.split("/").pop();
+              a.download = "";
+              linksDiv.appendChild(a);
+            });
+            document.getElementById("result").style.display = "";
+          } catch (err) {
+            alert("Network / server error: " + err.message);
+            console.error(err);
+          } finally {
+            btn.disabled = false;
+            btn.textContent = "Upload & Generate";
+          }
+        });
+    </script>
+  </body>
+</html>

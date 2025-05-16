@@ -31,7 +31,6 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	http.HandleFunc("/upload", uploadHandler)
 
-	// static file download
 	http.Handle("/download/",
 		http.StripPrefix("/download/",
 			http.FileServer(http.Dir("filtered"))))

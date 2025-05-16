@@ -6,17 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"sort"
 	"strings"
 	"time"
 )
 
-/* ───────── canonical 26‑column layout for filtered output ───────── */
+/* ── canonical 26-column header for filtered output ───────── */
 var targetHeader = []string{
 	"CdrNo", "B Party", "Date", "Time", "Duration", "Call Type",
 	"First Cell ID", "First Cell ID Address", "Last Cell ID", "Last Cell ID Address",
@@ -27,11 +27,12 @@ var targetHeader = []string{
 	"Type", "IMEI Manufacturer",
 }
 
-/* ───────── helpers ───────── */
+/* ── helpers ── */
 var (
 	spaceRE  = regexp.MustCompile(`\s+`)
 	nonDigit = regexp.MustCompile(`\D`)
 )
+
 func norm(s string) string { return spaceRE.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), " ") }
 func digits(s string) string { return nonDigit.ReplaceAllString(s, "") }
 func last10(s string) string { d := digits(s); if len(d) > 10 { return d[len(d)-10:] }; return d }
@@ -50,103 +51,120 @@ func colIdxAny(header []string, keys ...string) int {
 }
 func colIdx(header []string, key string) int { return colIdxAny(header, key) }
 
-/* ───────── banner‑line CDR extractor ───────── */
+/* ── banner CDR number extractor ── */
 var jioCdrRE = regexp.MustCompile(`(?i)input value[^0-9]*([0-9]{8,15})`)
 func extractCdrNumber(line string) string {
 	if m := jioCdrRE.FindStringSubmatch(line); len(m) > 1 { return m[1] }
 	return ""
 }
 
-/* ───────── embedded lookup data ───────── */
+/* ── embedded lookup data ── */
 //go:embed data/*
 var dataFS embed.FS
 
+/* Cell and LRN structures */
 type CellInfo struct{ Addr, Sub, Main, LatLonAz string }
-type LRNInfo  struct{ Provider, Circle, Operator string }
+type LRNInfo struct{ Provider, Circle, Operator string }
 
 var (
-	cellDB = map[string]map[string]CellInfo{} // tsp → map[cellID]info
-	lrnDB  = map[string]LRNInfo{}             // digits(LRN) → info
+	cellDB = map[string]map[string]CellInfo{}
+	lrnDB  = map[string]LRNInfo{}
 )
 
 func init() {
 	if err := loadCells("jio", "data/jio_cells.csv"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Fatalf("cell DB: %v", err)
+		panic(fmt.Errorf("loadCells jio failed: %w", err))
 	}
 	if err := loadLRN("data/LRN.csv"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("LRN.csv not loaded: %v (provider/circle columns will be blank)", err)
+		// Just warn, LRN missing won't crash
+		fmt.Printf("Warning: LRN.csv not loaded: %v\n", err)
 	}
 }
 
-/* ---------- loadCells ---------- */
+/* loadCells loads cell DB from CSV */
 func loadCells(tsp, path string) error {
 	f, err := dataFS.Open(path)
 	if err != nil { return err }
 	defer f.Close()
 
 	r := csv.NewReader(f)
-	header, err := r.Read(); if err != nil { return err }
-	idx := func(keys ...string) int { return colIdxAny(header, keys...) }
+	header, err := r.Read()
+	if err != nil { return err }
+	col := func(keys ...string) int {
+		for i, h := range header {
+			for _, k := range keys {
+				if norm(h) == norm(k) { return i }
+			}
+		}
+		return -1
+	}
 
-	iID := idx("cgi", "cell id")
-	iAddr, iSub := idx("address"), idx("subcity", "sub city")
-	iMain := idx("maincity", "city")
-	iLat, iLon, iAz := idx("latitude"), idx("longitude", "lon"), idx("azimuth", "az")
+	iID := col("cgi", "cell id", "cellid")
+	iAddr := col("address")
+	iSub := col("subcity", "sub city")
+	iMain := col("maincity", "main city", "city")
+	iLat := col("latitude", "lat")
+	iLon := col("longitude", "lon", "long")
+	iAz := col("azimuth", "azm", "az")
+
 	if iID == -1 { return fmt.Errorf("no CGI column in %s", path) }
-
 	cellDB[tsp] = map[string]CellInfo{}
+
 	for {
 		rec, err := r.Read()
 		if err == io.EOF { break }
 		if err != nil || len(rec) == 0 { continue }
-
-		raw := strings.TrimSpace(rec[iID]); if raw == "" { continue }
+		rawID := strings.TrimSpace(rec[iID])
+		if rawID == "" { continue }
 		info := CellInfo{
 			Addr:     pick(rec, iAddr),
 			Sub:      pick(rec, iSub),
 			Main:     pick(rec, iMain),
 			LatLonAz: buildLat(rec, iLat, iLon, iAz),
 		}
-		cellDB[tsp][raw]        = info
-		cellDB[tsp][digits(raw)] = info
+		cellDB[tsp][rawID] = info
+		cellDB[tsp][digits(rawID)] = info
 	}
 	return nil
 }
 
-/* ---------- loadLRN ---------- */
+/* loadLRN loads LRN DB */
 func loadLRN(path string) error {
 	f, err := dataFS.Open(path)
 	if err != nil { return err }
 	defer f.Close()
-
 	r := csv.NewReader(f)
-	header, err := r.Read(); if err != nil { return err }
+	header, err := r.Read()
+	if err != nil { return err }
 
-	iLRN   := colIdxAny(header, "lrn", "lrn no")
-	iTSP   := colIdxAny(header, "tsp", "provider")
-	iCircle:= colIdx(header, "circle")
-	if iLRN == -1 || iTSP == -1 { return fmt.Errorf("LRN.csv missing columns") }
+	idxLRN := colIdxAny(header, "lrn no", "lrn", "lrn number")
+	idxTSP := colIdxAny(header, "tsp", "provider", "tsp-lsa")
+	idxCircle := colIdxAny(header, "circle")
+	if idxLRN == -1 || idxTSP == -1 {
+		return fmt.Errorf("LRN.csv missing LRN/TSP columns")
+	}
 
 	for {
 		rec, err := r.Read()
 		if err == io.EOF { break }
 		if err != nil || len(rec) == 0 { continue }
 
-		key := digits(rec[iLRN]); if key == "" { continue }
+		key := digits(rec[idxLRN])
+		if key == "" { continue }
 		lrnDB[key] = LRNInfo{
-			Provider: pick(rec, iTSP),
-			Circle:   pick(rec, iCircle),
-			Operator: pick(rec, iTSP), // requirement: operator == provider
+			Provider: pick(rec, idxTSP),
+			Circle:   pick(rec, idxCircle),
+			Operator: pick(rec, idxTSP), // fallback operator = provider
 		}
 	}
 	return nil
 }
 
-/* misc helpers */
 func pick(rec []string, idx int) string {
 	if idx == -1 || idx >= len(rec) { return "" }
 	return strings.TrimSpace(rec[idx])
 }
+
 func buildLat(rec []string, iLat, iLon, iAz int) string {
 	if iLat == -1 || iLon == -1 { return "" }
 	lat, lon := pick(rec, iLat), pick(rec, iLon)
@@ -154,6 +172,7 @@ func buildLat(rec []string, iLat, iLon, iAz int) string {
 	if az := pick(rec, iAz); az != "" { return lat + ", " + lon + ", " + az }
 	return lat + ", " + lon
 }
+
 func findCell(tsp, id string) (CellInfo, bool) {
 	db := cellDB[tsp]
 	if info, ok := db[id]; ok { return info, true }
@@ -161,105 +180,118 @@ func findCell(tsp, id string) (CellInfo, bool) {
 	return CellInfo{}, false
 }
 
-/* ───────────────────── HTTP handler ───────────────────── */
-func UploadAndNormalizeCSV(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { http.Error(w, "POST only", 405); return }
-	if strings.ToLower(r.FormValue("tsp_type")) != "jio" {
-		http.Error(w, "Only Jio supported", 400); return
-	}
-	crime := r.FormValue("crime_number")
-
-	fh, hdr, err := r.FormFile("file")
-	if err != nil { http.Error(w, err.Error(), 400); return }
-	defer fh.Close()
-
-	_ = os.MkdirAll("uploads", 0o755)
-	_ = os.MkdirAll("filtered", 0o755)
-
-	src := filepath.Join("uploads", hdr.Filename)
-	if err := saveUploaded(fh, src); err != nil { http.Error(w, err.Error(), 500); return }
-
-	filtered, summary, err := normJio(src, crime)
-	if err != nil { http.Error(w, err.Error(), 500); return }
-
-	fmt.Fprintf(w, "/download/%s\n/download/%s\n", filepath.Base(filtered), filepath.Base(summary))
-}
-
+/* saveUploaded saves uploaded file */
 func saveUploaded(r io.Reader, dst string) error {
-	f, err := os.Create(dst); if err != nil { return err }
+	f, err := os.Create(dst)
+	if err != nil { return err }
 	defer f.Close()
 	_, err = io.Copy(f, r)
 	return err
 }
 
-/* ───────── enrichment for cell address columns ───────── */
-func enrich(row []string, col map[string]int, id string, first bool) {
-	if info, ok := findCell("jio", id); ok {
-		if first {
-			row[col["First Cell ID Address"]]          = info.Addr
-			row[col["Sub City (First CellID)"]]        = info.Sub
-			row[col["Main City(First CellID)"]]        = info.Main
-			row[col["Lat-Long-Azimuth (First CellID)"]] = info.LatLonAz
-		} else {
-			row[col["Last Cell ID Address"]] = info.Addr
-		}
+/* --- main handler --- */
+func UploadAndNormalizeCSV(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST only", 405)
+		return
 	}
+	if strings.ToLower(r.FormValue("tsp_type")) != "jio" {
+		http.Error(w, "Only Jio supported", 400)
+		return
+	}
+	crime := r.FormValue("crime_number")
+
+	fh, hdr, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	defer fh.Close()
+
+	os.MkdirAll("uploads", 0o755)
+	os.MkdirAll("filtered", 0o755)
+
+	src := filepath.Join("uploads", hdr.Filename)
+	if err := saveUploaded(fh, src); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	filtered, summary, maxCalls, maxDuration, maxStay, err := normJio(src, crime)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	fmt.Fprintf(w, "/download/%s\n/download/%s\n/download/%s\n/download/%s\n/download/%s\n",
+		filepath.Base(filtered), filepath.Base(summary), filepath.Base(maxCalls), filepath.Base(maxDuration), filepath.Base(maxStay))
 }
 
-/* ─────────────────── Jio normaliser (filtered + per‑party summary) ───── */
-func normJio(src, crime string) (filteredPath, summaryPath string, err error) {
-	in, err := os.Open(src); if err != nil { return "", "", err }
+/* Core normalization + summaries + max reports */
+func normJio(src, crime string) (string, string, string, string, string, error) {
+	in, err := os.Open(src)
+	if err != nil { return "", "", "", "", "", err }
 	defer in.Close()
 	r := csv.NewReader(in)
 
-	/* ── locate header row & essential indexes ── */
-	var (
-		header                                                []string
-		cdr                                                   string
-		iFirst, iLast, iCalling, iCalled, iInput             = -1, -1, -1, -1, -1
-	)
+	/* 1. Find header and CDR */
+	var header []string
+	var cdr string
+	var iFirst, iLast, iCalling, iCalled, iInput int = -1, -1, -1, -1, -1
 	for {
-		rec, er := r.Read()
-		if er == io.EOF { return "", "", errors.New("no header") }
-		if er != nil { continue }
-
-		if cdr == "" { cdr = extractCdrNumber(strings.Join(rec, " ")) }
-
+		rec, err := r.Read()
+		if err == io.EOF {
+			return "", "", "", "", "", errors.New("no header found")
+		}
+		if err != nil { continue }
+		if cdr == "" {
+			cdr = extractCdrNumber(strings.Join(rec, " "))
+		}
 		for i, h := range rec {
 			switch norm(h) {
-			case "first cgi", "first cell id": iFirst = i
-			case "last cgi",  "last cell id":  iLast  = i
-			case "calling party telephone number": iCalling = i
-			case "called party telephone number":  iCalled  = i
+			case "first cgi", "first cell id":
+				iFirst = i
+			case "last cgi", "last cell id":
+				iLast = i
+			case "calling party telephone number":
+				iCalling = i
+			case "called party telephone number":
+				iCalled = i
 			}
-			if strings.Contains(strings.ToLower(h), "input value") { iInput = i }
+			if strings.Contains(strings.ToLower(h), "input value") {
+				iInput = i
+			}
 		}
-		if iFirst != -1 && iLast != -1 { header = rec; break }
+		if iFirst != -1 && iLast != -1 {
+			header = rec
+			break
+		}
 	}
-
-	/* fallback CDR from first data line, if needed */
 	var firstRec []string
 	if cdr == "" && iInput != -1 {
 		firstRec, _ = r.Read()
 		if len(firstRec) > iInput {
-			if m := regexp.MustCompile(`\d{8,15}`).FindString(firstRec[iInput]); m != "" { cdr = m }
+			if m := regexp.MustCompile(`\d{8,15}`).FindString(firstRec[iInput]); m != "" {
+				cdr = m
+			}
 		}
 	}
-	if cdr == "" { return "", "", errors.New("CDR not found") }
+	if cdr == "" {
+		return "", "", "", "", "", errors.New("CDR not found")
+	}
 	cdr10 := last10(cdr)
 
-	/* -------- filtered writer -------- */
-	filteredPath = filepath.Join("filtered", cdr+"_reports.csv")
+	/* Setup filtered report */
+	filteredPath := filepath.Join("filtered", cdr+"_reports.csv")
 	fout, _ := os.Create(filteredPath)
 	defer fout.Close()
 	fw := csv.NewWriter(fout)
 	_ = fw.Write(targetHeader)
-
-	col := make(map[string]int)
+	col := map[string]int{}
 	for i, h := range targetHeader { col[h] = i }
 	blank := make([]string, len(targetHeader))
 
-	/* -------- multi‑party summary aggregator -------- */
+	/* Summary map: key = B Party */
 	type agg struct {
 		BParty, SDR, Provider, Type           string
 		TotalCalls, OutCalls, InCalls         int
@@ -273,74 +305,124 @@ func normJio(src, crime string) (filteredPath, summaryPath string, err error) {
 	timeLayout := "2006-01-02 15:04:05"
 	parseDT := func(d, t string) string {
 		dt := strings.TrimSpace(d) + " " + strings.TrimSpace(t)
-		if _, e := time.Parse(timeLayout, dt); e == nil { return dt }
+		if _, e := time.Parse(timeLayout, dt); e == nil {
+			return dt
+		}
 		return dt
 	}
 
+	/* Max stay: keyed by cell ID */
+	type maxStayAgg struct {
+		CellID, Addr, Lat, Lon, Azimuth, Roaming, FirstCall, LastCall string
+		TotalCalls                                                   int
+	}
+	maxStay := map[string]*maxStayAgg{}
+
+	/* Copy helper */
 	cp := func(rec []string, src int, dst string, row []string) {
-		if src >= 0 && src < len(rec) { row[col[dst]] = strings.Trim(rec[src], "'\" ") }
+		if src >= 0 && src < len(rec) {
+			row[col[dst]] = strings.Trim(rec[src], "'\" ")
+		}
 	}
 
+	/* Write one filtered row and update summaries */
 	writeRow := func(rec []string) {
-		if len(rec) == 0 { return }
-
+		if len(rec) == 0 {
+			return
+		}
 		row := append([]string(nil), blank...)
 		row[col["CdrNo"]] = cdr
 
-		iDate := colIdx(header, "call date")
-		iTime := colIdx(header, "call time")
-		iDur  := colIdxAny(header, "dur(s)", "duration(sec)", "call duration")
-		iIMEI := colIdx(header, "imei")
-		iIMSI := colIdx(header, "imsi")
-		iLRN  := colIdxAny(header, "lrn called no", "lrn no", "lrn")
-		iRoam := colIdx(header, "roaming circle name")
-		iCT   := colIdx(header, "call type")
-
-		cp(rec, iDate, "Date", row); cp(rec, iTime, "Time", row)
-		cp(rec, iDur,  "Duration", row)
-		cp(rec, iIMEI, "IMEI", row); cp(rec, iIMSI, "IMSI", row)
-		cp(rec, iLRN,  "LRN",  row)
+		// Basic copies
+		cp(rec, colIdx(header, "call date"), "Date", row)
+		cp(rec, colIdx(header, "call time"), "Time", row)
+		cp(rec, colIdxAny(header, "dur(s)", "duration(sec)", "call duration"), "Duration", row)
+		cp(rec, colIdx(header, "imei"), "IMEI", row)
+		cp(rec, colIdx(header, "imsi"), "IMSI", row)
+		cp(rec, colIdxAny(header, "lrn called no", "lrn no", "lrn"), "LRN", row)
 		cp(rec, colIdxAny(header, "call forward", "call fwd no", "call fow no"), "CallForward", row)
-		cp(rec, iRoam, "Roaming", row)
+		cp(rec, colIdx(header, "roaming circle name"), "Roaming", row)
 
-		switch ct := strings.ToUpper(strings.Trim(rec[iCT], "'\" ")); ct {
-		case "A_IN", "CALL_IN":  row[col["Call Type"]] = "CALL_IN"
-		case "A_OUT", "CALL_OUT": row[col["Call Type"]] = "CALL_OUT"
-		default: row[col["Call Type"]] = ct
+		// Call Type logic
+		ctIdx := colIdx(header, "call type")
+		ct := ""
+		if ctIdx >= 0 && ctIdx < len(rec) {
+			ct = strings.ToUpper(strings.Trim(rec[ctIdx], "'\" "))
+		}
+		switch ct {
+		case "A_IN", "CALL_IN":
+			row[col["Call Type"]] = "CALL_IN"
+			row[col["Type"]] = "Phone"
+		case "A_OUT", "CALL_OUT":
+			row[col["Call Type"]] = "CALL_OUT"
+			row[col["Type"]] = "Phone"
+		case "A2P_SMSIN", "P2P_SMSIN":
+			row[col["Call Type"]] = ct
+			row[col["Type"]] = "SMS"
+		default:
+			row[col["Call Type"]] = ct
 		}
 		row[col["Crime"]] = crime
 
-		firstID := cleanCGI(rec[iFirst]); lastID := cleanCGI(rec[iLast])
-		row[col["First Cell ID"]] = firstID; row[col["Last Cell ID"]] = lastID
-		enrich(row, col, firstID, true); enrich(row, col, lastID, false)
+		// First and Last Cell IDs
+		firstID := cleanCGI(rec[iFirst])
+		lastID := cleanCGI(rec[iLast])
+		row[col["First Cell ID"]] = firstID
+		row[col["Last Cell ID"]] = lastID
+		enrich(row, col, firstID, true)
+		enrich(row, col, lastID, false)
 
-		callRaw, calledRaw := strings.Trim(rec[iCalling], "'\" "), strings.Trim(rec[iCalled], "'\" ")
+		// B Party logic
+		callRaw := strings.Trim(rec[iCalling], "'\" ")
+		calledRaw := strings.Trim(rec[iCalled], "'\" ")
+		callDigits := last10(callRaw)
+		calledDigits := last10(calledRaw)
+
 		switch {
-		case last10(callRaw) == cdr10 && calledRaw != "": row[col["B Party"]] = calledRaw
-		case last10(calledRaw) == cdr10 && callRaw != "": row[col["B Party"]] = callRaw
+		case callDigits == cdr10 && calledRaw != "":
+			row[col["B Party"]] = calledRaw
+		case calledDigits == cdr10 && callRaw != "":
+			row[col["B Party"]] = callRaw
 		default:
-			if calledRaw != "" { row[col["B Party"]] = calledRaw } else { row[col["B Party"]] = callRaw }
+			if calledRaw != "" {
+				row[col["B Party"]] = calledRaw
+			} else {
+				row[col["B Party"]] = callRaw
+			}
 		}
 		bKey := row[col["B Party"]]
-		if bKey == "" { bKey = "(blank)" }
-
-		if info, ok := lrnDB[digits(row[col["LRN"]])]; ok {
-			row[col["B Party Provider"]] = info.Provider
-			row[col["B Party Circle"]]   = info.Circle
-			row[col["B Party Operator"]] = info.Operator
+		if bKey == "" {
+			bKey = "(blank)"
 		}
 
+		// Provider info via LRN
+		lrnDigits := digits(row[col["LRN"]])
+		if info, ok := lrnDB[lrnDigits]; ok {
+			row[col["B Party Provider"]] = info.Provider
+			row[col["B Party Circle"]] = info.Circle
+			row[col["B Party Operator"]] = info.Operator
+		} else {
+			// fallback: if blank, fill as Unknown
+			if row[col["B Party Provider"]] == "" {
+				row[col["B Party Provider"]] = "Unknown"
+			}
+		}
+
+		// Write filtered row
 		fw.Write(row)
 
-		/* ---- update / create aggregator ---- */
+		// Update summary aggregator
 		a, ok := summary[bKey]
 		if !ok {
 			a = &agg{
-				BParty: bKey, SDR: row[col["B Party Operator"]],
+				BParty: bKey,
+				SDR: row[col["B Party Operator"]],
 				Provider: row[col["B Party Provider"]],
 				Type: row[col["Type"]],
-				Days: map[string]struct{}{}, CellIds: map[string]struct{}{},
-				Imeis: map[string]struct{}{}, Imsis: map[string]struct{}{},
+				Days: make(map[string]struct{}),
+				CellIds: make(map[string]struct{}),
+				Imeis: make(map[string]struct{}),
+				Imsis: make(map[string]struct{}),
 			}
 			summary[bKey] = a
 		}
@@ -348,43 +430,108 @@ func normJio(src, crime string) (filteredPath, summaryPath string, err error) {
 		a.TotalCalls++
 		switch row[col["Call Type"]] {
 		case "CALL_OUT": a.OutCalls++
-		case "CALL_IN":  a.InCalls++
+		case "CALL_IN": a.InCalls++
 		default:
 			if strings.Contains(row[col["Call Type"]], "SMS") {
-				if strings.HasSuffix(row[col["Call Type"]], "OUT") { a.OutSMS++ } else { a.InSMS++ }
-			} else { a.OtherCalls++ }
+				if strings.HasSuffix(row[col["Call Type"]], "OUT") {
+					a.OutSMS++
+				} else {
+					a.InSMS++
+				}
+			} else {
+				a.OtherCalls++
+			}
 		}
 		if row[col["Roaming"]] != "" {
-			if strings.Contains(row[col["Call Type"]], "SMS") { a.RoamSMS++ } else { a.RoamCalls++ }
+			if strings.Contains(row[col["Call Type"]], "SMS") {
+				a.RoamSMS++
+			} else {
+				a.RoamCalls++
+			}
 		}
-		if dur, er := strconv.ParseFloat(row[col["Duration"]], 64); er == nil { a.TotalDuration += dur }
+
+		if dur, e := strconv.ParseFloat(row[col["Duration"]], 64); e == nil {
+			a.TotalDuration += dur
+		}
 
 		a.Days[row[col["Date"]]] = struct{}{}
-		if firstID != "" { a.CellIds[firstID] = struct{}{} }
-		if lastID  != "" { a.CellIds[lastID]  = struct{}{} }
-		if v := row[col["IMEI"]]; v != "" { a.Imeis[v] = struct{}{} }
-		if v := row[col["IMSI"]]; v != "" { a.Imsis[v] = struct{}{} }
+		if firstID != "" {
+			a.CellIds[firstID] = struct{}{}
+		}
+		if lastID != "" {
+			a.CellIds[lastID] = struct{}{}
+		}
+		if v := row[col["IMEI"]]; v != "" {
+			a.Imeis[v] = struct{}{}
+		}
+		if v := row[col["IMSI"]]; v != "" {
+			a.Imsis[v] = struct{}{}
+		}
 
 		dt := parseDT(row[col["Date"]], row[col["Time"]])
-		if a.FirstCall == "" || dt < a.FirstCall { a.FirstCall = dt }
-		if a.LastCall  == "" || dt > a.LastCall  { a.LastCall  = dt }
+		if a.FirstCall == "" || dt < a.FirstCall {
+			a.FirstCall = dt
+		}
+		if a.LastCall == "" || dt > a.LastCall {
+			a.LastCall = dt
+		}
+
+		// Update maxStay aggregator for first cell
+		if firstID != "" {
+			ms, ok := maxStay[firstID]
+			if !ok {
+				ms = &maxStayAgg{
+					CellID: firstID,
+					Addr:   row[col["First Cell ID Address"]],
+					Lat:    "",
+					Lon:    "",
+					Azimuth: "",
+					Roaming: row[col["Roaming"]],
+					FirstCall: dt,
+					LastCall:  dt,
+					TotalCalls: 1,
+				}
+				// parse lat/lon/azimuth
+				if llaz := row[col["Lat-Long-Azimuth (First CellID)"]]; llaz != "" {
+					parts := strings.Split(llaz, ",")
+					if len(parts) >= 2 {
+						ms.Lat = strings.TrimSpace(parts[0])
+						ms.Lon = strings.TrimSpace(parts[1])
+					}
+					if len(parts) == 3 {
+						ms.Azimuth = strings.TrimSpace(parts[2])
+					}
+				}
+				maxStay[firstID] = ms
+			} else {
+				ms.TotalCalls++
+				if dt < ms.FirstCall { ms.FirstCall = dt }
+				if dt > ms.LastCall { ms.LastCall = dt }
+			}
+		}
 	}
 
-	/* -------- iterate through CSV -------- */
-	if len(firstRec) > 0 { writeRow(firstRec) }
+	if len(firstRec) > 0 {
+		writeRow(firstRec)
+	}
 	for {
-		rec, er := r.Read()
-		if er == io.EOF { break }
-		if er != nil || len(rec) == 0 { continue }
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil || len(rec) == 0 {
+			continue
+		}
 		writeRow(rec)
 	}
 	fw.Flush()
 
-	/* -------- write summary file -------- */
-	summaryPath = filepath.Join("filtered", cdr+"_summary_reports.csv")
+	// Write multi-party summary
+	summaryPath := filepath.Join("filtered", cdr+"_summary_reports.csv")
 	sout, _ := os.Create(summaryPath)
 	defer sout.Close()
 	sw := csv.NewWriter(sout)
+
 	sw.Write([]string{
 		"CdrNo", "B Party", "B Party SDR", "Provider", "Type",
 		"Total Calls", "Out Calls", "In Calls", "Out Sms", "In Sms",
@@ -392,21 +539,130 @@ func normJio(src, crime string) (filteredPath, summaryPath string, err error) {
 		"Total Days", "Total CellIds", "Total Imei", "Total Imsi",
 		"First Call", "Last Call",
 	})
+
 	for _, a := range summary {
 		sw.Write([]string{
 			cdr, a.BParty, a.SDR, a.Provider, a.Type,
-			fmt.Sprint(a.TotalCalls), fmt.Sprint(a.OutCalls), fmt.Sprint(a.InCalls),
-			fmt.Sprint(a.OutSMS), fmt.Sprint(a.InSMS), fmt.Sprint(a.OtherCalls),
-			fmt.Sprint(a.RoamCalls), fmt.Sprint(a.RoamSMS),
+			strconv.Itoa(a.TotalCalls), strconv.Itoa(a.OutCalls), strconv.Itoa(a.InCalls),
+			strconv.Itoa(a.OutSMS), strconv.Itoa(a.InSMS), strconv.Itoa(a.OtherCalls),
+			strconv.Itoa(a.RoamCalls), strconv.Itoa(a.RoamSMS),
 			fmt.Sprintf("%.0f", a.TotalDuration),
-			fmt.Sprint(len(a.Days)), fmt.Sprint(len(a.CellIds)),
-			fmt.Sprint(len(a.Imeis)), fmt.Sprint(len(a.Imsis)),
+			strconv.Itoa(len(a.Days)), strconv.Itoa(len(a.CellIds)),
+			strconv.Itoa(len(a.Imeis)), strconv.Itoa(len(a.Imsis)),
 			a.FirstCall, a.LastCall,
 		})
 	}
 	sw.Flush()
 
-	return filteredPath, summaryPath, nil
+	// Write max calls report
+	maxCallsPath := filepath.Join("filtered", cdr+"_max_calls_reports.csv")
+	mcF, _ := os.Create(maxCallsPath)
+	defer mcF.Close()
+	mcw := csv.NewWriter(mcF)
+
+	mcw.Write([]string{"CdrNo", "B Party", "B Party SDR", "Total Calls", "Provider"})
+
+	// Also compute total calls across all parties for summary row
+	totalCalls := 0
+	for _, a := range summary {
+		totalCalls += a.TotalCalls
+	}
+	// Write total row with B Party as CDR (like your sample)
+	mcw.Write([]string{"Total", cdr, "", strconv.Itoa(totalCalls), ""})
+
+	// Sort by total calls desc (optional)
+	type kv struct {
+		Key string
+		Val *agg
+	}
+	var sorted []kv
+	for k, v := range summary {
+		sorted = append(sorted, kv{k, v})
+	}
+	// Sort descending
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Val.TotalCalls > sorted[j].Val.TotalCalls })
+
+	for _, kvp := range sorted {
+		provider := kvp.Val.Provider
+		if provider == "" {
+			provider = "Unknown"
+		}
+		mcw.Write([]string{cdr, kvp.Key, "", strconv.Itoa(kvp.Val.TotalCalls), provider})
+	}
+	mcw.Flush()
+
+	// Write max duration report
+	maxDurationPath := filepath.Join("filtered", cdr+"_max_duration_reports.csv")
+	mdF, _ := os.Create(maxDurationPath)
+	defer mdF.Close()
+	mdw := csv.NewWriter(mdF)
+
+	mdw.Write([]string{"CdrNo", "B Party", "B Party SDR", "Total Duration", "Provider"})
+
+	// Sort by total duration desc
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Val.TotalDuration > sorted[j].Val.TotalDuration })
+
+	for _, kvp := range sorted {
+		provider := kvp.Val.Provider
+		if provider == "" {
+			provider = "Unknown"
+		}
+		mdw.Write([]string{
+			cdr, kvp.Key, "", fmt.Sprintf("%.0f", kvp.Val.TotalDuration), provider,
+		})
+	}
+	mdw.Flush()
+
+	// Write max stay report
+	maxStayPath := filepath.Join("filtered", cdr+"_max_stay_reports.csv")
+	msF, _ := os.Create(maxStayPath)
+	defer msF.Close()
+	msw := csv.NewWriter(msF)
+	msw.Write([]string{
+		"CdrNo", "Cell ID", "Total Calls", "Tower Address", "Latitude", "Longitude", "Azimuth", "Roaming", "First Call", "Last Call",
+	})
+
+	for _, ms := range maxStay {
+		addr := ms.Addr
+		if addr == "" {
+			addr = "Unknown"
+		}
+		roaming := ms.Roaming
+		if roaming == "" {
+			roaming = "Unknown"
+		}
+		lat := ms.Lat
+		if lat == "" {
+			lat = "0"
+		}
+		lon := ms.Lon
+		if lon == "" {
+			lon = "0"
+		}
+		az := ms.Azimuth
+		if az == "" {
+			az = "0"
+		}
+		msw.Write([]string{
+			cdr, ms.CellID, strconv.Itoa(ms.TotalCalls), addr, lat, lon, az, roaming, ms.FirstCall, ms.LastCall,
+		})
+	}
+	msw.Flush()
+
+	return filteredPath, summaryPath, maxCallsPath, maxDurationPath, maxStayPath, nil
 }
 
-/* ─────────────────────────────────────────────────────────── */
+/* enrich cell address fields */
+func enrich(row []string, col map[string]int, id string, first bool) {
+	if info, ok := findCell("jio", id); ok {
+		if first {
+			row[col["First Cell ID Address"]] = info.Addr
+			row[col["Sub City (First CellID)"]] = info.Sub
+			row[col["Main City(First CellID)"]] = info.Main
+			row[col["Lat-Long-Azimuth (First CellID)"]] = info.LatLonAz
+		} else {
+			row[col["Last Cell ID Address"]] = info.Addr
+		}
+	}
+}
+
