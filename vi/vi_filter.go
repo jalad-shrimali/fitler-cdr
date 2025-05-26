@@ -1,541 +1,365 @@
+// vi_filter.go
 package vi
 
 import (
-	"embed"
+	"database/sql"
+	_ "github.com/mattn/go-sqlite3"
 	"encoding/csv"
-	"errors"
 	"fmt"
 	"io"
-	"os"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/xuri/excelize/v2"
 )
 
-/* canonical 26-column output header */
+/* ── canonical 26-column header ─────────────────────────── */
 var targetHeader = []string{
 	"CdrNo", "B Party", "Date", "Time", "Duration", "Call Type",
 	"First Cell ID", "First Cell ID Address", "Last Cell ID", "Last Cell ID Address",
 	"IMEI", "IMSI", "Roaming",
-	"Main City(First CellID)", "Sub City (First CellID)", "Lat-Long-Azimuth (First CellID)",
-	"Crime", "Circle", "Operator", "LRN",
-	"CallForward", "B Party Provider", "B Party Circle", "B Party Operator",
-	"Type", "IMEI Manufacturer",
+	"Lat", "Long", "Azimuth",
+	"Crime", "Circle(A-party)", "Operator(A-party)", "LRN",
+	"CallForward", "B Party Provider", "B Party Circle",
+	"Type", "IMEI Manufacturer", "TimeHH",
 }
 
-/* helpers */
+/* ── helpers ── */
 var (
 	spaceRE  = regexp.MustCompile(`\s+`)
 	nonDigit = regexp.MustCompile(`\D`)
 )
-func norm(s string) string { return spaceRE.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), " ") }
+func norm(s string) string   { return spaceRE.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), " ") }
 func digits(s string) string { return nonDigit.ReplaceAllString(s, "") }
-func cleanCGI(s string) string { return digits(s) }
-
-/* column index finder */
-func colIdxAny(header []string, keys ...string) int {
-	for _, k := range keys {
-		for i, h := range header {
-			if norm(h) == norm(k) {
-				return i
-			}
-		}
-	}
-	return -1
-}
-func colIdx(header []string, key string) int { return colIdxAny(header, key) }
-
-/* CDR extractor */
-var msisdnRE = regexp.MustCompile(`(?i)msisdn[^0-9]*([0-9]{8,15})`)
-func extractCdrNumber(line string) string {
-	if m := msisdnRE.FindStringSubmatch(line); len(m) > 1 {
-		return m[1]
-	}
+func last10(s string) string {
+	d := digits(s)
+	if len(d) > 10 { return d[len(d)-10:] }
+	if len(d) == 10 { return d }
 	return ""
 }
 
-/* embedded data */
-//go:embed data/*
-var dataFS embed.FS
+/* banner CDR extractor */
+var msisdnRE = regexp.MustCompile(`(?i)msisdn[^0-9]*([0-9]{8,15})`)
+func extractCDR(line string) string {
+	if m := msisdnRE.FindStringSubmatch(line); len(m) > 1 { return m[1] }
+	return ""
+}
 
-/* Cell and LRN types */
-type CellInfo struct{ Addr, Sub, Main, LatLonAz string }
-type LRNInfo struct{ Provider, Circle, Operator string }
-
+/* ── lookup tables & cell DB ── */
 var (
-	cellDB = map[string]map[string]CellInfo{}
-	lrnDB  = map[string]LRNInfo{}
+	alias2canon = map[string]string{}
+	callAlias   = map[string]struct{}{}
+	lrnDB       = map[string]struct{ Provider, Circle, Operator string }{}
+	cellDB      *sql.DB
 )
 
-func init() {
-	if err := loadCells("vi", "data/vi_cells.csv"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		panic(fmt.Errorf("loadCells vi failed: %w", err))
-	}
-	if err := loadLRN("data/LRN.csv"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		fmt.Printf("Warning: LRN.csv not loaded: %v\n", err)
-	}
-}
-
-func loadCells(tsp, path string) error {
-	f, err := dataFS.Open(path)
-	if err != nil { return err }
+/* ---------- init: load metadata ---------- */
+func loadCSV(p string) [][]string {
+	f, e := os.Open(p); if e != nil { return nil }
 	defer f.Close()
-	r := csv.NewReader(f)
-	header, err := r.Read()
-	if err != nil { return err }
-	col := func(keys ...string) int {
-		for i, h := range header {
-			for _, k := range keys {
-				if norm(h) == norm(k) { return i }
+	rows, _ := csv.NewReader(f).ReadAll()
+	return rows
+}
+func init() {
+	for _, r := range loadCSV(filepath.Join("vi", "data", "Headers.csv")) {
+		if len(r) >= 2 {
+			alias2canon[norm(r[0])] = r[1]
+			alias2canon[norm(r[1])] = r[0]
+		}
+	}
+	for _, r := range loadCSV(filepath.Join("vi", "data", "Call_types.csv")) {
+		if len(r) > 0 { callAlias[norm(r[0])] = struct{}{} }
+	}
+	if rows := loadCSV(filepath.Join("vi", "data", "LRN.csv")); len(rows) > 1 {
+		h := rows[0]
+		idx := func(keys ...string) int {
+			for i, c := range h { for _, k := range keys {
+				if norm(c) == norm(k) { return i } } }
+			return -1
+		}
+		iLRN, iTSP, iCir := idx("lrn", "lrn no"), idx("tsp", "provider"), idx("circle")
+		for _, r := range rows[1:] {
+			k := digits(r[iLRN]); if k == "" { continue }
+			lrnDB[k] = struct{ Provider, Circle, Operator string }{
+				strings.TrimSpace(r[iTSP]), strings.TrimSpace(r[iCir]), strings.TrimSpace(r[iTSP]),
 			}
 		}
-		return -1
 	}
-	iID := col("cgi", "cell global id", "cell id")
-	iAddr := col("address", "bts location")
-	iSub := col("subcity", "sub city")
-	iMain := col("maincity", "city", "main city")
-	iLat := col("latitude", "lat")
-	iLon := col("longitude", "lon", "long")
-	iAz := col("azimuth", "azm", "az")
-	if iID == -1 { return fmt.Errorf("no CGI column in %s", path) }
-	cellDB[tsp] = map[string]CellInfo{}
-	for {
-		rec, err := r.Read()
-		if err == io.EOF { break }
-		if err != nil || len(rec) == 0 { continue }
-		cgi := strings.TrimSpace(rec[iID])
-		if cgi == "" { continue }
-		info := CellInfo{
-			Addr:     pick(rec, iAddr),
-			Sub:      pick(rec, iSub),
-			Main:     pick(rec, iMain),
-			LatLonAz: buildLat(rec, iLat, iLon, iAz),
-		}
-		cellDB[tsp][cgi] = info
-		cellDB[tsp][digits(cgi)] = info
-	}
-	return nil
+	var err error
+	cellDB, err = sql.Open("sqlite3",
+		fmt.Sprintf("file:%s?mode=ro", filepath.Join("vi", "data", "testnewcellids.db")))
+	if err != nil { panic(err) }
+}
+func lookupCell(id string) (addr, lat, lon, az string, ok bool) {
+	const q = `SELECT address,latitude,longitude,azimuth FROM cellids
+	           WHERE cellid=? OR REPLACE(cellid,'-','')=? LIMIT 1`
+	err := cellDB.QueryRow(q, id, id).Scan(&addr, &lat, &lon, &az)
+	return addr, lat, lon, az, err == nil
 }
 
-func loadLRN(path string) error {
-	f, err := dataFS.Open(path)
-	if err != nil { return err }
-	defer f.Close()
-	r := csv.NewReader(f)
-	header, err := r.Read()
-	if err != nil { return err }
-	iLRN := colIdxAny(header, "lrn no", "lrn", "lrn number")
-	iTSP := colIdxAny(header, "tsp", "provider", "tsp-lsa")
-	iCircle := colIdxAny(header, "circle")
-	if iLRN == -1 { return fmt.Errorf("no LRN column in %s", path) }
-	for {
-		rec, err := r.Read()
-		if err == io.EOF { break }
-		if err != nil || len(rec) == 0 { continue }
-		lrn := digits(rec[iLRN])
-		if lrn == "" { continue }
-		lrnDB[lrn] = LRNInfo{
-			Provider: pick(rec, iTSP),
-			Circle:   pick(rec, iCircle),
-			Operator: pick(rec, iTSP),
-		}
-	}
-	return nil
-}
-
-func pick(rec []string, idx int) string {
-	if idx == -1 || idx >= len(rec) { return "" }
-	return strings.TrimSpace(rec[idx])
-}
-func buildLat(rec []string, iLat, iLon, iAz int) string {
-	if iLat == -1 || iLon == -1 { return "" }
-	lat, lon := pick(rec, iLat), pick(rec, iLon)
-	if lat == "" || lon == "" { return "" }
-	if az := pick(rec, iAz); az != "" { return lat + ", " + lon + ", " + az }
-	return lat + ", " + lon
-}
-func findCell(tsp, id string) (CellInfo, bool) {
-	db := cellDB[tsp]
-	if info, ok := db[id]; ok { return info, true }
-	if info, ok := db[digits(id)]; ok { return info, true }
-	return CellInfo{}, false
-}
-
-func saveUploaded(r io.Reader, dst string) error {
-	f, err := os.Create(dst)
-	if err != nil { return err }
-	defer f.Close()
-	_, err = io.Copy(f, r)
-	return err
-}
-
+/* ── HTTP handler ── */
 func UploadAndNormalizeCSV(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "POST only", 405)
-		return
-	}
-	if strings.ToLower(r.FormValue("tsp_type")) != "vi" {
-		http.Error(w, "Only VI supported", 400)
-		return
-	}
+	if r.Method != http.MethodPost { http.Error(w, "POST only", 405); return }
+	if norm(r.FormValue("tsp_type")) != "vi" { http.Error(w, "Only VI", 400); return }
 	crime := r.FormValue("crime_number")
 
 	fh, hdr, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 400); return }
 	defer fh.Close()
-
-	os.MkdirAll("uploads", 0o755)
-	os.MkdirAll("filtered", 0o755)
-
+	_ = os.MkdirAll("uploads", 0o755); _ = os.MkdirAll("filtered", 0o755)
 	src := filepath.Join("uploads", hdr.Filename)
-	if err := saveUploaded(fh, src); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
+	if err := saveFile(fh, src); err != nil { http.Error(w, err.Error(), 500); return }
 
-	filtered, summary, maxCalls, maxDuration, maxStay, err := normVI(src, crime)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	fmt.Fprintf(w, "/download/%s\n/download/%s\n/download/%s\n/download/%s\n/download/%s\n",
-		filepath.Base(filtered), filepath.Base(summary), filepath.Base(maxCalls), filepath.Base(maxDuration), filepath.Base(maxStay))
+	out, err := processVI(src, crime)
+	if err != nil { http.Error(w, err.Error(), 500); return }
+	fmt.Fprintf(w, "/download/%s\n", filepath.Base(out))
+}
+func saveFile(r io.Reader, dst string) error {
+	f, err := os.Create(dst); if err != nil { return err }
+	defer f.Close(); _, err = io.Copy(f, r); return err
 }
 
-func last10(s string) string {
-	if len(s) <= 10 {
-		return s
-	}
-	return s[len(s)-10:]
-}
+/* ── core processor ─────────────────────────────────────── */
+func processVI(src, crime string) (string, error) {
+	f, err := os.Open(src); if err != nil { return "", err }
+	defer f.Close()
+	r := csv.NewReader(f)
 
-func normVI(src, crime string) (string, string, string, string, string, error) {
-	in, err := os.Open(src)
-	if err != nil { return "", "", "", "", "", err }
-	defer in.Close()
-	r := csv.NewReader(in)
-
-	// Find header and CDR
-	var header []string
-	var cdr string
+	/* banner + header */
+	var header []string; var cdr string
 	for {
-		rec, err := r.Read()
-		if err == io.EOF { return "", "", "", "", "", errors.New("no header found") }
-		if err != nil { continue }
-		if cdr == "" {
-			cdr = extractCdrNumber(strings.Join(rec, " "))
-		}
-		if colIdx(rec, "call date") != -1 {
-			header = rec
-			break
-		}
+		rec, er := r.Read()
+		if er == io.EOF { return "", fmt.Errorf("no header") }
+		if er != nil { continue }
+		if cdr == "" { cdr = extractCDR(strings.Join(rec, " ")) }
+		if colIdx(rec, "call date") != -1 { header = rec; break }
 	}
-	idxMSISDN := colIdxAny(header, "msisdn", "msisdn no", "msisdn number")
-	firstData, err := r.Read()
-	if err != nil { return "", "", "", "", "", errors.New("header present but no data") }
-	if cdr == "" && idxMSISDN != -1 && idxMSISDN < len(firstData) {
-		cdr = digits(firstData[idxMSISDN])
-	}
-	// Removed unused variable cdr10
-
-	idxDate := colIdx(header, "call date")
-	idxTime := colIdx(header, "call initiation time")
-	idxDur := colIdxAny(header, "call duration", "duration")
-	idxBparty := colIdxAny(header, "b party number", "b party no")
-	idxType := colIdx(header, "call_type")
-	idxFirstID := colIdxAny(header, "first cell global id")
-	idxFirstAddr := colIdxAny(header, "first bts location")
-	idxLastID := colIdxAny(header, "last cell global id")
-	idxLastAddr := colIdxAny(header, "last bts location")
-	idxIMEI := colIdx(header, "imei")
-	idxIMSI := colIdx(header, "imsi")
-	idxRoam := colIdxAny(header, "roaming network/circle", "roaming network")
-	idxLRN := colIdxAny(header, "lrn- b party number", "lrn b party number")
-	idxService := colIdx(header, "service type")
-
-	filteredPath := filepath.Join("filtered", cdr+"_reports.csv")
-	fout, _ := os.Create(filteredPath)
-	defer fout.Close()
-	fw := csv.NewWriter(fout)
-	_ = fw.Write(targetHeader)
-	col := map[string]int{}
-	for i, h := range targetHeader { col[h] = i }
-	blank := make([]string, len(targetHeader))
-
-	type agg struct {
-		BParty, SDR, Provider, Type           string
-		TotalCalls, OutCalls, InCalls         int
-		OutSMS, InSMS, OtherCalls             int
-		RoamCalls, RoamSMS                    int
-		TotalDuration                         float64
-		Days, CellIds, Imeis, Imsis           map[string]struct{}
-		FirstCall, LastCall                   string
-	}
-	summary := map[string]*agg{}
-
-	type maxStayAgg struct {
-		CellID, Addr, Lat, Lon, Azimuth, Roaming, FirstCall, LastCall string
-		TotalCalls                                                    int
-	}
-	maxStay := map[string]*maxStayAgg{}
-
-	timeLayout := "2006-01-02 15:04:05"
-	parseDT := func(d, t string) string {
-		dt := strings.TrimSpace(d) + " " + strings.TrimSpace(t)
-		if _, e := time.Parse(timeLayout, dt); e == nil {
-			return dt
-		}
-		return dt
-	}
-
-	cp := func(rec []string, src int, dst string, row []string) {
-		if src >= 0 && src < len(rec) {
-			row[col[dst]] = strings.Trim(rec[src], "'\" ")
+	first, _ := r.Read()
+	if cdr == "" {
+		if i := colIdxAny(header, "msisdn", "msisdn number"); i != -1 && i < len(first) {
+			cdr = digits(first[i])
 		}
 	}
+	if cdr == "" { cdr = digits(filepath.Base(src)) }
+	if cdr == "" { return "", fmt.Errorf("cannot determine CDR") }
 
-	writeRow := func(rec []string) {
+	/* ---------- column mapping ---------- */
+	dstIdx := func(name string) int {
+		for i, h := range targetHeader { if h == name { return i } }
+		return -1
+	}
+	src2dst := map[int]int{}
+
+	for i, h := range header {
+		n := norm(h)
+
+		if alias2canon[n] == "B Party" {
+			if d := dstIdx("B Party"); d != -1 { src2dst[i] = d }
+
+		} else if strings.Contains(n, "b party") && strings.Contains(n, "no") {
+			if d := dstIdx("B Party"); d != -1 { src2dst[i] = d }
+
+		} else if canon, ok := alias2canon[n]; ok {
+			if d := dstIdx(canon); d != -1 { src2dst[i] = d }
+
+		} else if _, ok := callAlias[n]; ok {
+			if d := dstIdx("Call Type"); d != -1 { src2dst[i] = d }
+		}
+	}
+	hard := func(key, canon string) {
+		if i := colIdx(header, key); i != -1 {
+			if d := dstIdx(canon); d != -1 { src2dst[i] = d }
+		}
+	}
+	hard("call date", "Date"); hard("call initiation time", "Time")
+	hard("call duration", "Duration"); hard("b party number", "B Party")
+	hard("first cell global id", "First Cell ID"); hard("first bts location", "First Cell ID Address")
+	hard("last cell global id", "Last Cell ID"); hard("last bts location", "Last Cell ID Address")
+	hard("imei", "IMEI"); hard("imsi", "IMSI")
+	hard("roaming network", "Roaming"); hard("lrn b party number", "LRN")
+	hard("service type", "Type")
+
+	/* ---------- buffers ---------- */
+	report := [][]string{targetHeader}
+
+	type pAgg struct {
+		Calls, OutC, InC, OutS, InS int
+		Dur                         float64
+		Dates, Cells                map[string]struct{}
+		Fd, Ft, Ld, Lt              string
+	}
+	parties := map[string]*pAgg{}
+
+	type cAgg struct {
+		Addr, Lat, Lon, Az, Roam    string
+		Calls                       int
+		Fd, Ft, Ld, Lt              string
+	}
+	cells := map[string]*cAgg{}
+	updateDT := func(d, t string, fd, ft, ld, lt *string) {
+		if *fd == "" || d < *fd || (d == *fd && t < *ft) { *fd, *ft = d, t }
+		if *ld == "" || d > *ld || (d == *ld && t > *lt) { *ld, *lt = d, t }
+	}
+
+	/* ---------- per-row processing ---------- */
+	process := func(rec []string) {
 		if len(rec) == 0 { return }
-		row := append([]string(nil), blank...)
-		row[col["CdrNo"]] = cdr
-		row[col["Crime"]] = crime
+		row := make([]string, len(targetHeader))
+		for s, d := range src2dst {
+			if d < 0 || s >= len(rec) { continue }
+			val := strings.Trim(rec[s], `"' `)
+			if d == dstIdx("B Party") { val = last10(val) }
+			row[d] = val
+		}
+		row[dstIdx("CdrNo")] = cdr
+		row[dstIdx("Crime")] = crime
+		if t := row[dstIdx("Time")]; len(t) >= 2 { row[dstIdx("TimeHH")] = t[:2] }
 
-		cp(rec, idxDate, "Date", row)
-		cp(rec, idxTime, "Time", row)
-		cp(rec, idxDur, "Duration", row)
-		cp(rec, idxBparty, "B Party", row)
-		cp(rec, idxType, "Call Type", row)
-		cp(rec, idxFirstID, "First Cell ID", row)
-		cp(rec, idxFirstAddr, "First Cell ID Address", row)
-		cp(rec, idxLastID, "Last Cell ID", row)
-		cp(rec, idxLastAddr, "Last Cell ID Address", row)
-		cp(rec, idxIMEI, "IMEI", row)
-		cp(rec, idxIMSI, "IMSI", row)
-		cp(rec, idxRoam, "Roaming", row)
-		cp(rec, idxLRN, "LRN", row)
-		cp(rec, idxService, "Type", row)
-
-		// enrich cell details
-		if firstID := pick(rec, idxFirstID); firstID != "" {
-			if info, ok := findCell("vi", firstID); ok {
-				row[col["Main City(First CellID)"]] = info.Main
-				row[col["Sub City (First CellID)"]] = info.Sub
-				row[col["Lat-Long-Azimuth (First CellID)"]] = info.LatLonAz
-				if row[col["First Cell ID Address"]] == "" {
-					row[col["First Cell ID Address"]] = info.Addr
-				}
-			}
+		fid := strings.ReplaceAll(row[dstIdx("First Cell ID")], "-", "")
+		lid := strings.ReplaceAll(row[dstIdx("Last Cell ID")], "-", "")
+		row[dstIdx("First Cell ID")] = fid
+		row[dstIdx("Last Cell ID")] = lid
+		if addr, lat, lon, az, ok := lookupCell(fid); ok {
+			row[dstIdx("First Cell ID Address")] = addr
+			row[dstIdx("Lat")] = lat; row[dstIdx("Long")] = lon; row[dstIdx("Azimuth")] = az
+		}
+		if addr, _, _, _, ok := lookupCell(lid); ok {
+			row[dstIdx("Last Cell ID Address")] = addr
 		}
 
-		// Provider/circle/operator from LRN
-		if l := digits(pick(rec, idxLRN)); l != "" {
+		if l := digits(row[dstIdx("LRN")]); l != "" {
 			if info, ok := lrnDB[l]; ok {
-				row[col["B Party Provider"]] = info.Provider
-				row[col["B Party Circle"]] = info.Circle
-				row[col["B Party Operator"]] = info.Operator
+				row[dstIdx("B Party Provider")] = info.Provider
+				row[dstIdx("B Party Circle")] = info.Circle
 			}
 		}
 
-		fw.Write(row)
+		report = append(report, row)
 
-		bKey := row[col["B Party"]]
-		if bKey == "" { bKey = "(blank)" }
-		a, ok := summary[bKey]
-		if !ok {
-			a = &agg{
-				BParty: bKey, SDR: row[col["B Party Operator"]],
-				Provider: row[col["B Party Provider"]],
-				Type: row[col["Type"]],
-				Days: map[string]struct{}{}, CellIds: map[string]struct{}{},
-				Imeis: map[string]struct{}{}, Imsis: map[string]struct{}{},
+		/* per-party aggregate */
+		b := row[dstIdx("B Party")]; if b == "" { b = "(blank)" }
+		pa := parties[b]; if pa == nil {
+			pa = &pAgg{Dates: map[string]struct{}{}, Cells: map[string]struct{}{}}
+			parties[b] = pa
+		}
+		pa.Calls++
+		switch strings.ToUpper(row[dstIdx("Call Type")]) {
+		case "OUT": pa.OutC++
+		case "IN": pa.InC++
+		case "OUT SMS": pa.OutS++
+		case "IN SMS": pa.InS++
+		}
+		if d, e := strconv.ParseFloat(row[dstIdx("Duration")], 64); e == nil { pa.Dur += d }
+		pa.Dates[row[dstIdx("Date")]] = struct{}{}
+		if fid != "" { pa.Cells[fid] = struct{}{} }
+		updateDT(row[dstIdx("Date")], row[dstIdx("Time")], &pa.Fd, &pa.Ft, &pa.Ld, &pa.Lt)
+
+		/* per-cell aggregate */
+		if fid != "" {
+			ca := cells[fid]; if ca == nil { ca = &cAgg{}; cells[fid] = ca }
+			ca.Calls++
+			if ca.Addr == "" {
+				ca.Addr = row[dstIdx("First Cell ID Address")]
+				ca.Lat = row[dstIdx("Lat")]; ca.Lon = row[dstIdx("Long")]; ca.Az = row[dstIdx("Azimuth")]
+				ca.Roam = row[dstIdx("Roaming")]
 			}
-			summary[bKey] = a
-		}
-
-		a.TotalCalls++
-		switch row[col["Call Type"]] {
-		case "CALL_OUT": a.OutCalls++
-		case "CALL_IN": a.InCalls++
-		default:
-			if strings.Contains(row[col["Call Type"]], "SMS") {
-				if strings.HasSuffix(row[col["Call Type"]], "OUT") { a.OutSMS++ } else { a.InSMS++ }
-			} else { a.OtherCalls++ }
-		}
-		if row[col["Roaming"]] != "" {
-			if strings.Contains(row[col["Call Type"]], "SMS") { a.RoamSMS++ } else { a.RoamCalls++ }
-		}
-		if dur, err := strconv.ParseFloat(row[col["Duration"]], 64); err == nil {
-			a.TotalDuration += dur
-		}
-		a.Days[row[col["Date"]]] = struct{}{}
-		if firstID := row[col["First Cell ID"]]; firstID != "" { a.CellIds[firstID] = struct{}{} }
-		if lastID := row[col["Last Cell ID"]]; lastID != "" { a.CellIds[lastID] = struct{}{} }
-		if v := row[col["IMEI"]]; v != "" { a.Imeis[v] = struct{}{} }
-		if v := row[col["IMSI"]]; v != "" { a.Imsis[v] = struct{}{} }
-
-		dt := parseDT(row[col["Date"]], row[col["Time"]])
-		if a.FirstCall == "" || dt < a.FirstCall { a.FirstCall = dt }
-		if a.LastCall == "" || dt > a.LastCall { a.LastCall = dt }
-
-		// max stay aggregator for first cell
-		if firstID := row[col["First Cell ID"]]; firstID != "" {
-			ms, ok := maxStay[firstID]
-			if !ok {
-				ms = &maxStayAgg{
-					CellID:    firstID,
-					Addr:      row[col["First Cell ID Address"]],
-					Roaming:   row[col["Roaming"]],
-					FirstCall: dt,
-					LastCall:  dt,
-					TotalCalls: 1,
-				}
-				if llaz := row[col["Lat-Long-Azimuth (First CellID)"]]; llaz != "" {
-					parts := strings.Split(llaz, ",")
-					if len(parts) >= 2 {
-						ms.Lat = strings.TrimSpace(parts[0])
-						ms.Lon = strings.TrimSpace(parts[1])
-					}
-					if len(parts) == 3 {
-						ms.Azimuth = strings.TrimSpace(parts[2])
-					}
-				}
-				maxStay[firstID] = ms
-			} else {
-				ms.TotalCalls++
-				if dt < ms.FirstCall { ms.FirstCall = dt }
-				if dt > ms.LastCall { ms.LastCall = dt }
-			}
+			updateDT(row[dstIdx("Date")], row[dstIdx("Time")], &ca.Fd, &ca.Ft, &ca.Ld, &ca.Lt)
 		}
 	}
 
-	// write all rows
-	writeRow(firstData)
+	process(first)
 	for {
-		rec, err := r.Read()
-		if err == io.EOF { break }
-		if err != nil || len(rec) == 0 { continue }
-		writeRow(rec)
+		rec, er := r.Read()
+		if er == io.EOF { break }
+		if er != nil || len(rec) == 0 { continue }
+		process(rec)
 	}
-	fw.Flush()
 
-	// Write summary CSV
-	summaryPath := filepath.Join("filtered", cdr+"_summary_reports.csv")
-	sout, _ := os.Create(summaryPath)
-	defer sout.Close()
-	sw := csv.NewWriter(sout)
-	sw.Write([]string{
-		"CdrNo", "B Party", "B Party SDR", "Provider", "Type",
+	/* ---------- summary / max sheets ---------- */
+	summary := [][]string{{
+		"CdrNo", "B Party", "Provider", "Type",
 		"Total Calls", "Out Calls", "In Calls", "Out Sms", "In Sms",
-		"Other Calls", "Roam Calls", "Roam Sms", "Total Duration",
-		"Total Days", "Total CellIds", "Total Imei", "Total Imsi",
-		"First Call", "Last Call",
-	})
-	for _, a := range summary {
-		sw.Write([]string{
-			cdr, a.BParty, a.SDR, a.Provider, a.Type,
-			strconv.Itoa(a.TotalCalls), strconv.Itoa(a.OutCalls), strconv.Itoa(a.InCalls),
-			strconv.Itoa(a.OutSMS), strconv.Itoa(a.InSMS), strconv.Itoa(a.OtherCalls),
-			strconv.Itoa(a.RoamCalls), strconv.Itoa(a.RoamSMS),
-			fmt.Sprintf("%.0f", a.TotalDuration),
-			strconv.Itoa(len(a.Days)), strconv.Itoa(len(a.CellIds)),
-			strconv.Itoa(len(a.Imeis)), strconv.Itoa(len(a.Imsis)),
-			a.FirstCall, a.LastCall,
+		"Total Duration", "Total Days", "Total CellIds",
+		"First Call Date", "First Call Time", "Last Call Date", "Last Call Time",
+	}}
+	for p, a := range parties {
+		summary = append(summary, []string{
+			cdr, p, "", "",
+			strconv.Itoa(a.Calls),
+			strconv.Itoa(a.OutC), strconv.Itoa(a.InC),
+			strconv.Itoa(a.OutS), strconv.Itoa(a.InS),
+			fmt.Sprintf("%.0f", a.Dur),
+			strconv.Itoa(len(a.Dates)), strconv.Itoa(len(a.Cells)),
+			a.Fd, a.Ft, a.Ld, a.Lt,
 		})
 	}
-	sw.Flush()
+	type kv struct{ Party string; *pAgg }
+	var list []kv
+	for p, v := range parties { list = append(list, kv{p, v}) }
+	sort.Slice(list, func(i, j int) bool { return list[i].Calls > list[j].Calls })
+	maxC := [][]string{{"CdrNo", "B Party", "Total Calls", "Provider"}}
+	for _, v := range list { maxC = append(maxC, []string{cdr, v.Party, strconv.Itoa(v.Calls), ""}) }
+	sort.Slice(list, func(i, j int) bool { return list[i].Dur > list[j].Dur })
+	maxD := [][]string{{"CdrNo", "B Party", "Total Duration", "Provider"}}
+	for _, v := range list { maxD = append(maxD, []string{cdr, v.Party, fmt.Sprintf("%.0f", v.Dur), ""}) }
 
-	// max calls report
-	maxCallsPath := filepath.Join("filtered", cdr+"_max_calls_reports.csv")
-	mcF, _ := os.Create(maxCallsPath)
-	defer mcF.Close()
-	mcw := csv.NewWriter(mcF)
-	mcw.Write([]string{"CdrNo", "B Party", "B Party SDR", "Total Calls", "Provider"})
-
-	totalCalls := 0
-	for _, a := range summary {
-		totalCalls += a.TotalCalls
-	}
-	mcw.Write([]string{"Total", cdr, "", strconv.Itoa(totalCalls), ""})
-
-	type kv struct {
-		Key string
-		Val *agg
-	}
-	var sorted []kv
-	for k, v := range summary {
-		sorted = append(sorted, kv{k, v})
-	}
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Val.TotalCalls > sorted[j].Val.TotalCalls })
-
-	for _, kvp := range sorted {
-		provider := kvp.Val.Provider
-		if provider == "" { provider = "Unknown" }
-		mcw.Write([]string{cdr, kvp.Key, "", strconv.Itoa(kvp.Val.TotalCalls), provider})
-	}
-	mcw.Flush()
-
-	// max duration report
-	maxDurationPath := filepath.Join("filtered", cdr+"_max_duration_reports.csv")
-	mdF, _ := os.Create(maxDurationPath)
-	defer mdF.Close()
-	mdw := csv.NewWriter(mdF)
-	mdw.Write([]string{"CdrNo", "B Party", "B Party SDR", "Total Duration", "Provider"})
-
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Val.TotalDuration > sorted[j].Val.TotalDuration })
-
-	for _, kvp := range sorted {
-		provider := kvp.Val.Provider
-		if provider == "" { provider = "Unknown" }
-		mdw.Write([]string{
-			cdr, kvp.Key, "", fmt.Sprintf("%.0f", kvp.Val.TotalDuration), provider,
+	/* max-stay */
+	type cv struct{ ID string; *cAgg }
+	var clist []cv
+	for id, c := range cells { clist = append(clist, cv{id, c}) }
+	sort.Slice(clist, func(i, j int) bool { return clist[i].Calls > clist[j].Calls })
+	maxS := [][]string{{
+		"CdrNo", "Cell ID", "Total Calls", "Days",
+		"Tower Address", "Latitude", "Longitude", "Azimuth", "Roaming",
+		"First Call Date", "First Call Time", "Last Call Date", "Last Call Time",
+	}}
+	for _, v := range clist {
+		days := "-"
+		if v.Fd != "" && v.Ld != "" {
+			t1, _ := time.Parse("2006-01-02", v.Fd)
+			t2, _ := time.Parse("2006-01-02", v.Ld)
+			days = strconv.Itoa(int(t2.Sub(t1).Hours()/24) + 1)
+		}
+		maxS = append(maxS, []string{
+			cdr, v.ID, strconv.Itoa(v.Calls), days,
+			v.Addr, v.Lat, v.Lon, v.Az, v.Roam,
+			v.Fd, v.Ft, v.Ld, v.Lt,
 		})
 	}
-	mdw.Flush()
 
-	// max stay report
-	maxStayPath := filepath.Join("filtered", cdr+"_max_stay_reports.csv")
-	msF, _ := os.Create(maxStayPath)
-	defer msF.Close()
-	msw := csv.NewWriter(msF)
-	msw.Write([]string{
-		"CdrNo", "Cell ID", "Total Calls", "Tower Address", "Latitude", "Longitude", "Azimuth", "Roaming", "First Call", "Last Call",
-	})
-
-	for _, ms := range maxStay {
-		addr := ms.Addr
-		if addr == "" {
-			addr = "Unknown"
+	/* ---------- workbook ---------- */
+	x := excelize.NewFile()
+	put := func(name string, rows [][]string, active bool) {
+		idx, _ := x.NewSheet(name)
+		for r, row := range rows {
+			for c, v := range row {
+				cell, _ := excelize.CoordinatesToCellName(c+1, r+1)
+				x.SetCellStr(name, cell, v)
+			}
 		}
-		roaming := ms.Roaming
-		if roaming == "" {
-			roaming = "Unknown"
-		}
-		lat := ms.Lat
-		if lat == "" {
-			lat = "0"
-		}
-		lon := ms.Lon
-		if lon == "" {
-			lon = "0"
-		}
-		az := ms.Azimuth
-		if az == "" {
-			az = "0"
-		}
-		msw.Write([]string{
-			cdr, ms.CellID, strconv.Itoa(ms.TotalCalls), addr, lat, lon, az, roaming, ms.FirstCall, ms.LastCall,
-		})
+		if active { x.SetActiveSheet(idx) }
 	}
-	msw.Flush()
+	put("report", report, true)
+	put("summary", summary, false)
+	put("max_calls", maxC, false)
+	put("max_duration", maxD, false)
+	put("max_stay", maxS, false)
+	x.DeleteSheet("Sheet1")
+	out := filepath.Join("filtered", cdr+"_vi_all_reports.xlsx")
+	if err := x.SaveAs(out); err != nil { return "", err }
+	return out, nil
+}
 
-	return filteredPath, summaryPath, maxCallsPath, maxDurationPath, maxStayPath, nil
+/* header helpers */
+func colIdxAny(h []string, keys ...string) int { for _, k := range keys { if i := colIdx(h, k); i != -1 { return i } }; return -1 }
+func colIdx(h []string, key string) int {
+	key = norm(key)
+	for i, x := range h { if norm(x) == key { return i } }
+	return -1
 }
